@@ -1,0 +1,12 @@
+[repository]
+name = "hyprland-gpu-switch"
+authors = ["yayuuu"]
+
+[hyprland-gpu-switch]
+description = "Automatic compositor renderer switching between integrated and discrete GPUs."
+authors = ["yayuuu"]
+output = "hyprland-gpu-switch.so"
+build = [
+    "make clean",
+    "make DIAGNOSTICS=0",
+]

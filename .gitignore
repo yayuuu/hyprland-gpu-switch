@@ -1,0 +1,22 @@
+# Build outputs
+*.so
+*.so.new
+*.o
+/gpu-switch-probe
+/policy-test
+/buffer-compat-test
+/route-plan-test
+/native-test
+/transfer-test
+
+# Local diagnostics and editor files
+__pycache__/
+*.pyc
+*.log
+core
+core.*
+*.swp
+*~
+
+# Per-profile build directories
+/.build/
