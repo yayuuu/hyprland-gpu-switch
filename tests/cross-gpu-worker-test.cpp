@@ -20,7 +20,7 @@ struct Source {
     VkInstance instance{};VkPhysicalDevice physical{};VkDevice device{};VkQueue queue{};
     VkImage image{};VkDeviceMemory memory{};VkCommandPool pool{};VkCommandBuffer command{};
     VkSubresourceLayout layout{};uint64_t modifier=0;uint32_t format=DRM_FORMAT_ABGR16161616F;FD fd,acquire;std::optional<GPUDevice> pendingProducer;uint32_t family=0,external=VK_QUEUE_FAMILY_EXTERNAL;
-    Source(const GPUDevice& gpu,bool tiled=false,bool alpha=false,uint32_t pixelFormat=DRM_FORMAT_ABGR16161616F) {
+    Source(const GPUDevice& gpu,bool tiled=false,bool alpha=false,uint32_t pixelFormat=DRM_FORMAT_ABGR16161616F,bool native=false) {
         format=pixelFormat;
         modifier=tiled?0x0100000000000001ULL:0;
         VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};app.apiVersion=VK_API_VERSION_1_2;
@@ -47,16 +47,18 @@ struct Source {
         float priority=1;VkDeviceQueueCreateInfo qi{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};qi.queueFamilyIndex=family;qi.queueCount=1;qi.pQueuePriorities=&priority;
         VkDeviceCreateInfo dc{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};dc.queueCreateInfoCount=1;dc.pQueueCreateInfos=&qi;dc.enabledExtensionCount=extensions.size();dc.ppEnabledExtensionNames=extensions.data();check(vkCreateDevice(physical,&dc,nullptr,&device),"device");vkGetDeviceQueue(device,family,0,&queue);
         VkImageDrmFormatModifierListCreateInfoEXT mods{VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT};mods.drmFormatModifierCount=1;mods.pDrmFormatModifiers=&modifier;
-        VkExternalMemoryImageCreateInfo ext{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO};ext.handleTypes=VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;ext.pNext=&mods;
-        VkImageCreateInfo imageInfo{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};imageInfo.pNext=&ext;imageInfo.imageType=VK_IMAGE_TYPE_2D;imageInfo.format=transportFormat(format).value().vk;imageInfo.extent={64,32,1};imageInfo.mipLevels=1;imageInfo.arrayLayers=1;imageInfo.samples=VK_SAMPLE_COUNT_1_BIT;imageInfo.tiling=VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;imageInfo.usage=VK_IMAGE_USAGE_SAMPLED_BIT|VK_IMAGE_USAGE_TRANSFER_SRC_BIT|VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        VkExternalMemoryImageCreateInfo ext{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO};ext.handleTypes=VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;ext.pNext=native?nullptr:&mods;
+        VkImageCreateInfo imageInfo{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};imageInfo.pNext=&ext;imageInfo.imageType=VK_IMAGE_TYPE_2D;imageInfo.format=transportFormat(format).value().vk;imageInfo.extent={64,32,1};imageInfo.mipLevels=1;imageInfo.arrayLayers=1;imageInfo.samples=VK_SAMPLE_COUNT_1_BIT;imageInfo.tiling=native?VK_IMAGE_TILING_OPTIMAL:VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;imageInfo.usage=VK_IMAGE_USAGE_SAMPLED_BIT|VK_IMAGE_USAGE_TRANSFER_SRC_BIT|VK_IMAGE_USAGE_TRANSFER_DST_BIT;
         check(vkCreateImage(device,&imageInfo,nullptr,&image),"source image");
         VkMemoryRequirements req{};vkGetImageMemoryRequirements(device,image,&req);VkPhysicalDeviceMemoryProperties mem{};vkGetPhysicalDeviceMemoryProperties(physical,&mem);
-        uint32_t type=0;for(;type<mem.memoryTypeCount;++type)if((req.memoryTypeBits&(1u<<type)) && (mem.memoryTypes[type].propertyFlags&(VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))==(VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))break;
+        const VkMemoryPropertyFlags required=native?VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT:VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        uint32_t type=0;for(;type<mem.memoryTypeCount;++type)if((req.memoryTypeBits&(1u<<type)) && (mem.memoryTypes[type].propertyFlags&required)==required)break;
         if(type==mem.memoryTypeCount)throw std::runtime_error("No host-visible source memory");
         VkExportMemoryAllocateInfo exportInfo{VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO};exportInfo.handleTypes=VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
         VkMemoryDedicatedAllocateInfo dedicated{VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO};dedicated.image=image;dedicated.pNext=&exportInfo;
         VkMemoryAllocateInfo alloc{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};alloc.pNext=&dedicated;alloc.allocationSize=req.size;alloc.memoryTypeIndex=type;check(vkAllocateMemory(device,&alloc,nullptr,&memory),"source memory");check(vkBindImageMemory(device,image,memory,0),"bind source");
-        VkImageSubresource sub{VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT,0,0};vkGetImageSubresourceLayout(device,image,&sub,&layout);
+        if(native) {layout.offset=0;layout.rowPitch=64*8;}
+        else {VkImageSubresource sub{VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT,0,0};vkGetImageSubresourceLayout(device,image,&sub,&layout);}
         VkCommandPoolCreateInfo pi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};pi.queueFamilyIndex=family;check(vkCreateCommandPool(device,&pi,nullptr,&pool),"pool");VkCommandBufferAllocateInfo ca{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};ca.commandPool=pool;ca.level=VK_COMMAND_BUFFER_LEVEL_PRIMARY;ca.commandBufferCount=1;check(vkAllocateCommandBuffers(device,&ca,&command),"commands");
         transition(false);
         check(vkResetCommandPool(device,pool,0),"reset clear pool");VkCommandBufferBeginInfo clearBegin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};check(vkBeginCommandBuffer(command,&clearBegin),"begin clear");
@@ -112,14 +114,15 @@ struct Child {
     ~Child(){socket.reset();if(pid>0){int status;while(waitpid(pid,&status,0)<0 && errno==EINTR){}}}
 };
 int main(int argc,char** argv){
-    if(argc!=4 && argc!=5){std::cerr<<"usage: cross-gpu-worker-test WORKER SOURCE_RENDER_NODE TARGET_RENDER_NODE [copy|copy-tiled]\n";return 2;}
+    if(argc!=4 && argc!=5){std::cerr<<"usage: cross-gpu-worker-test WORKER SOURCE_RENDER_NODE TARGET_RENDER_NODE [copy|copy-tiled|pq-native]\n";return 2;}
     try {
         auto all=gpuDevices();auto found=std::ranges::find_if(all,[&](const auto& d){return d.node==argv[2];});if(found==all.end())throw std::runtime_error("Unknown source node");auto gpu=*found;
-        const bool copyOnly=argc==5;const bool tiled=copyOnly && std::string(argv[4]).find("tiled")!=std::string::npos;
+        const bool native=argc==5 && std::string(argv[4])=="pq-native";
+        const bool copyOnly=argc==5 && !native;const bool tiled=copyOnly && std::string(argv[4]).find("tiled")!=std::string::npos;
         const bool eight=copyOnly && std::string(argv[4]).starts_with("copy8");
         const bool ten=copyOnly && std::string(argv[4]).starts_with("copy10");
         const uint32_t pixelFormat=eight?DRM_FORMAT_ABGR8888:ten?DRM_FORMAT_ABGR2101010:DRM_FORMAT_ABGR16161616F;
-        Source source(gpu,tiled,copyOnly,pixelFormat);
+        Source source(gpu,tiled,copyOnly,pixelFormat,native);
         sync_file_info fenceInfo{};
         if(source.acquire.value>=0 && !ioctl(source.acquire.value,SYNC_IOC_FILE_INFO,&fenceInfo)) {
             std::vector<sync_fence_info> fences(fenceInfo.num_fences);fenceInfo.sync_fence_info=reinterpret_cast<uint64_t>(fences.data());
@@ -129,10 +132,11 @@ int main(int argc,char** argv){
         if(!identified)identified=source.pendingProducer;
         if(identified && identified->id!=gpu.id)throw std::runtime_error("DMA-BUF provenance mismatch");
         if(!identified)throw std::runtime_error("Source provenance unavailable even before fence completion");
-        Child child(argv[1]);Packet hello;hello.type=HELLO;hello.width=64;hello.height=32;if(copyOnly)hello.fdFlags|=COPY_ONLY;hello.format=pixelFormat;hello.gpuMajor=gpu.renderMajor;hello.gpuMinor=gpu.renderMinor;hello.gpuPCI=gpu.pci;send(child.socket.value,hello);std::vector<FD> fds;auto ready=child.receive(fds);if(ready.type!=READY)throw std::runtime_error("Not ready");
+        Child child(argv[1]);Packet hello;hello.type=HELLO;if(native)hello.fdFlags|=PREFER_LOCAL_INPUT|PIPELINED;hello.width=64;hello.height=32;if(copyOnly)hello.fdFlags|=COPY_ONLY;hello.format=pixelFormat;hello.gpuMajor=gpu.renderMajor;hello.gpuMinor=gpu.renderMinor;hello.gpuPCI=gpu.pci;send(child.socket.value,hello);std::vector<FD> fds;auto ready=child.receive(fds);if(ready.type!=READY)throw std::runtime_error("Not ready");
         Packet job;job.type=CONVERT;job.width=64;job.height=32;job.format=pixelFormat;job.stride=source.layout.rowPitch;job.offset=source.layout.offset;job.source=1;job.serial=1;job.modifier=source.modifier;if(copyOnly)job.fdFlags|=COPY_ONLY;job.color[0]=job.color[5]=job.color[10]=job.color[13]=job.color[15]=1;
         std::vector<int> inputs{source.fd.value};if(source.acquire.value>=0){job.fdFlags|=ACQUIRE;inputs.push_back(source.acquire.value);}
-        send(child.socket.value,job,inputs);auto output=child.receive(fds);if(output.type!=RESULT || fds.empty())throw std::runtime_error("Invalid result");
+        if(native)job.fdFlags|=NATIVE_INPUT;
+        send(child.socket.value,job,inputs);auto output=child.receive(fds);if(native && !(output.fdFlags&SOURCE_DEVICE_LOCAL))throw std::runtime_error("Native source was not imported in device-local memory");if(output.type!=RESULT || fds.empty())throw std::runtime_error("Invalid result");
         if(output.fdFlags&COMPLETE){pollfd p{fds.at(1).value,POLLIN,0};if(poll(&p,1,10000)<=0)throw std::runtime_error("Conversion fence timeout");}
         TargetGL target(argv[3]);
         std::cout<<"Target external-only modifier: "<<externalOutput(target.display,output.format)<<'\n';

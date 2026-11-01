@@ -34,14 +34,17 @@ static std::string describeVramInput(Render::ITexture* texture) {
     return std::format("bufferTex={} live={} native={} {}", (void*)texture, found->second.texture.lock().get() == texture, found->second.nativeLayout, found->second.layoutReason);
 }
 
-static void vramBufferConstructor(void* object, uint32_t id, wl_client* client, const Aquamarine::SDMABUFAttrs& attrs) {
+using DMABufferFDs=std::array<Hyprutils::OS::CFileDescriptor,4>;
+static_assert(std::is_constructible_v<CDMABuffer,uint32_t,wl_client*,const Aquamarine::SDMABUFAttrs&,DMABufferFDs>);
+static void vramBufferConstructor(void* object, uint32_t id, wl_client* client, const Aquamarine::SDMABUFAttrs& attrs, DMABufferFDs fds) {
     SessionScope selected(g_state?g_state->vram.session:nullptr);
     pid_t pid = 0; wl_client_get_credentials(client, &pid, nullptr, nullptr);
     const bool previous = g_vramConstructing;
     g_vramConstructing = g_state && g_state->vram.protectNew && pid == g_state->vram.pid && currentNV().sourceGPU && Offload::exporterDriver(currentNV().sourceGPU->driver)=="nvidia";
     Render::CScopeGuard restore([&] { g_vramConstructing = previous; });
-    using F = void (*)(void*, uint32_t, wl_client*, const Aquamarine::SDMABUFAttrs&);
-    reinterpret_cast<F>(g_vramCtorHook->m_original)(object, id, client, attrs);
+    using F = void (*)(void*, uint32_t, wl_client*, const Aquamarine::SDMABUFAttrs&, DMABufferFDs);
+    // The core owns every plane FD after construction, including on failure.
+    reinterpret_cast<F>(g_vramCtorHook->m_original)(object, id, client, attrs, std::move(fds));
 }
 
 static SP<Render::ITexture> vramCreateTexture(void* renderer, const Aquamarine::SDMABUFAttrs& attrs, bool opaque) {
@@ -66,8 +69,9 @@ static SP<Render::ITexture> vramCreateTexture(void* renderer, const Aquamarine::
     std::erase_if(g_state->vram.proxies, [](const auto& item) { return item.second.texture.expired(); });
     // Native image layout is selected explicitly for this producer. Padding
     // in its advertised row pitch does not turn an optimal image into linear.
-    g_state->vram.proxies.emplace(proxy.get(), SState::SVramInput::SProxy{.texture = proxy, .savedDescription = {}, .savedCMCache = {}, .slot = {}, .bound = false, .nativeLayout = local.value_or(false) && g_state->vram.feedback && g_state->vram.nativeLayout, .layoutReason = {}});
+    g_state->vram.proxies.emplace(proxy.get(), SState::SVramInput::SProxy{.session = &currentNV(), .texture = proxy, .savedDescription = {}, .savedCMCache = {}, .slot = {}, .bound = false, .nativeLayout = local.value_or(false) && g_state->vram.feedback && g_state->vram.nativeLayout, .layoutReason = {}});
     g_state->vram.proxies.at(proxy.get()).layoutReason = std::format("local={} feedback={} requestedNative={} tight={}", local ? (*local ? "yes" : "no") : "unknown", g_state->vram.feedback, g_state->vram.nativeLayout, attrs.strides[0] == attrs.size.x * 8);
+    g_state->vram.proxies.at(proxy.get()).source=std::make_unique<Offload::RetainedSource>(attrs);
     ++g_state->vram.protectedTextures;
     return proxy;
 }
@@ -221,7 +225,7 @@ static bool setVramInput(bool enable, bool native = false) {
         if (!stat((std::filesystem::path("/dev/dri") / name).c_str(), &info)) { device = info.st_rdev; break; }
     }
     if (!device) { g_vramError = "no NVIDIA render node"; return false; }
-    if (!installVramHook(g_vramCtorHook, "CDMABuffer", "CDMABuffer::CDMABuffer(unsigned int, wl_client*, Aquamarine::SDMABUFAttrs const&)", reinterpret_cast<void*>(&vramBufferConstructor)) ||
+    if (!installVramHook(g_vramCtorHook, "CDMABuffer", "CDMABuffer::CDMABuffer(unsigned int, wl_client*, Aquamarine::SDMABUFAttrs const&, std::array<Hyprutils::OS::CFileDescriptor, 4ul>)", reinterpret_cast<void*>(&vramBufferConstructor)) ||
         !installVramHook(g_vramUnbindHook, "unbind", "Render::GL::CGLTexture::unbind()", reinterpret_cast<void*>(&vramUnbind)) ||
         !installVramHook(g_vramFeedbackHook, "sendDefaultFeedback", "CLinuxDMABUFFeedbackResource::sendDefaultFeedback()", reinterpret_cast<void*>(&vramDefaultFeedback)))
         return false;
@@ -233,6 +237,7 @@ static bool setVramInput(bool enable, bool native = false) {
     const auto before = state.feedbackSent;
     for (const auto& feedback : PROTO::linuxDma->m_feedbacks) sendVramFeedback(feedback.get());
     if (before == state.feedbackSent) { g_vramError = "no matching surface feedback among " + std::to_string(PROTO::linuxDma->m_feedbacks.size()); setVramInput(false); return false; }
+    g_vramError.clear();
     return true;
 }
 

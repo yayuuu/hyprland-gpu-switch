@@ -39,6 +39,7 @@
 #include <hyprland/src/render/Shader.hpp>
 #include <hyprland/src/render/SyncFDManager.hpp>
 #include <hyprland/src/render/pass/SurfacePassElement.hpp>
+#include <hyprland/src/render/pass/BackdropScopePassElement.hpp>
 #include <hyprland/src/state/MonitorState.hpp>
 #include <hyprland/src/protocols/DRMSyncobj.hpp>
 #include <hyprland/src/managers/eventLoop/EventLoopManager.hpp>
@@ -603,7 +604,14 @@ void GpuSwitch::observeRenderedSurface(Render::CRenderContext& ctx, CSurfacePass
 static CSurfacePassElement* eligibleSurface(Render::CRenderContext& ctx, PHLMONITOR monitor) {
     auto& pass = g_pHyprRenderer->currentPass(ctx);
     std::string names;
+    std::vector<Singlepass::SPassEntry> entries;
     for (const auto& item : pass.m_passElements) {
+        Singlepass::SPassEntry entry;
+        if (const auto* marker = dynamic_cast<CBackdropScopePassElement*>(item.element.get())) {
+            entry.kind = marker->action() == CBackdropScopePassElement::eAction::BEGIN ? Singlepass::EPassEntry::ScopeBegin : Singlepass::EPassEntry::ScopeEnd;
+            entry.scope = marker->scope().get();
+        }
+        entries.push_back(entry);
         if (!names.empty())
             names += ",";
         names += item.element ? item.element->passName() : "null";
@@ -616,15 +624,22 @@ static CSurfacePassElement* eligibleSurface(Render::CRenderContext& ctx, PHLMONI
     g_state->lastPassInfo = std::format("{} elements: {}", pass.m_passElements.size(), names);
     if (&pass != &ctx.m_pass || pass.m_passElements.empty())
         return nullptr;
-    auto index = pass.m_passElements.size() - 1;
+    const auto content = Singlepass::passContentIndices(entries);
+    if (!content || content->empty()) {
+        g_state->lastPassInfo += " (empty content or unbalanced backdrop scopes)";
+        return nullptr;
+    }
+    auto contentIndex = content->size() - 1;
+    auto index = content->at(contentIndex);
     g_state->candidateCursor.reset();
     const auto& top = pass.m_passElements.at(index).element;
     if (top && top->type() == EK_TEXTURE) {
         const auto* cursor = dynamic_cast<CTexPassElement*>(top.get());
-        if (!cursor || index == 0 || cursor->m_data.tex != Pointer::mgr()->getCurrentCursorTexture() || cursor->m_data.blur || cursor->m_data.motionBlur.enabled ||
+        if (!cursor || contentIndex == 0 || cursor->m_data.tex != Pointer::mgr()->getCurrentCursorTexture() || cursor->m_data.blur || cursor->m_data.motionBlur.enabled ||
             cursor->m_data.box.w > 256 || cursor->m_data.box.h > 256 || cursor->m_data.workspacePresentation.workspaceScene)
             return nullptr;
-        g_state->candidateCursor = index--;
+        g_state->candidateCursor = index;
+        index = content->at(--contentIndex);
     }
     g_state->candidateIndex = index;
     const auto& element = pass.m_passElements.at(index).element;
@@ -665,8 +680,8 @@ static CSurfacePassElement* eligibleSurface(Render::CRenderContext& ctx, PHLMONI
     }
     // Wine may have an entirely occluded parent surface below its opaque HDR
     // subsurface. Only ordinary surfaces of this same window may be omitted.
-    for (size_t i = 0; i < index; ++i) {
-        const auto& below = pass.m_passElements.at(i).element;
+    for (size_t i = 0; i < contentIndex; ++i) {
+        const auto& below = pass.m_passElements.at(content->at(i)).element;
         const auto* s = below ? dynamic_cast<CSurfacePassElement*>(below.get()) : nullptr;
         if (!s || s->m_data.pWindow != solitary || s->m_data.popup || below->undiscardable(ctx))
             return nullptr;

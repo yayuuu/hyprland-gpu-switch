@@ -98,6 +98,8 @@ Synchronization device handles and DMA-BUF feedback follow the selected renderer
 
 The plugin uses Hyprland and Aquamarine internals. The running Hyprland hash must match the development headers. Aquamarine internal declarations are pinned to 0.15.1, commit `f31c47a1b9d300847d8fc3108ad959448103dfc1`; preserve their upstream license in `vendor/aquamarine/LICENSE`.
 
+The DMA-BUF constructor hook forwards the owned array of plane file descriptors added in Hyprland 0.57; the core retains sole ownership. Native-input setup errors remain visible even when initialization fails before a session claims the feedback route. Protected textures retain the source session and independently owned plane FDs: after `wl_buffer` destruction, the core may invalidate its borrowed DMA-BUF attributes while the texture is still current. Native producer identity is reused only after worker inspection and matching texture, surface and window identities.
+
 Function lookup uses `function-hooks.hpp` to demangle the exact symbol signature associated with its address, rather than trusting separately cached name lists. Preserve this check when adding hooks. Render-pass hooks and elements must forward the supplied `CRenderContext`, including for isolated capture; texture bind hooks borrow that context only during synchronous pass execution.
 
 The module uses `RTLD_NODELETE` because live buffers can retain C++ callbacks. Replacing a file at the same path does not replace code already mapped in a running process. The plugin refuses unloading after migration; use disable to pause policy decisions, and start a new session to test a replacement build with complete tracking.
@@ -136,13 +138,15 @@ make gpu-transfer-test
 .build/release/cross-gpu-worker-test .build/release/gpu-transfer-worker /dev/dri/renderD129 /dev/dri/renderD128
 ```
 
-Append `copy`, `copy-tiled`, `copy8`, `copy8-tiled` or `copy10-tiled` to test native-format transport. Tiled cases require a source GPU supporting the requested modifier. Tests create offscreen buffers only and verify fences, color/alpha values and GL state restoration. They do not connect to Wayland or perform renderer migration.
+Append `copy`, `copy-tiled`, `copy8`, `copy8-tiled` or `copy10-tiled` to test native-format transport. Append `pq-native` to create an optimal, device-local FP16 source and verify the native VRAM-to-PQ path, including the device-local import flag, completion fence and output pixels. Tiled cases require a source GPU supporting the requested modifier. Tests create offscreen buffers only and verify fences, color/alpha values and GL state restoration. They do not connect to Wayland or perform renderer migration.
 
 `make check` also tests producer provenance and borrowing unique-owned queued states without converting weak pointers to shared ownership. `hyprctl gpu-switch transfers` retains operational status in release builds and adds frame counters in diagnostic builds. Detailed worker output is compiled out by default.
 
 Output routes hold weak monitor references and retire buffers for destroyed or replaced outputs. A route must not extend a monitor's lifetime after the core clears `m_output`: late `wl_output` binds can otherwise reach a live monitor with no backing output. DPMS alone does not invalidate an attached output. The route-lifetime regression test covers these cases without connecting to a compositor.
 
-The rendering-policy test checks every fullscreen safety gate and unique-owned capture-frame lifetime. `make DIAGNOSTICS=1 tools` also builds `frame-cadence-probe.so`, an opt-in event-listener probe for client commits, rendering and presentation cadence. It does not modify rendering and is not loaded automatically. Timing traces and GPU query profiling require a diagnostic build; normal builds retain operational optimization status.
+The retained-source test closes the original plane FD and invalidates the borrowed attributes, then checks that the retained view preserves layout and storage until its own destruction. `make DIAGNOSTICS=1 tools` also builds the read-only `transfer-timers.so` inspector (`hyprctl gpu-transfer-timers`).
+
+The rendering-policy test checks every fullscreen safety gate, balanced Hyprland 0.57 backdrop scope markers, preservation of all drawable entries for overlay checks, and unique-owned capture-frame lifetime. `make DIAGNOSTICS=1 tools` also builds `frame-cadence-probe.so`, an opt-in event-listener probe for client commits, rendering and presentation cadence. It does not modify rendering and is not loaded automatically. Timing traces and GPU query profiling require a diagnostic build; normal builds retain operational optimization status.
 
 Transport sessions use stable heap addresses keyed by weak surface and window
 identities, rather than PID alone (one process can own multiple windows).

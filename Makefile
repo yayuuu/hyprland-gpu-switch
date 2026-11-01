@@ -175,3 +175,14 @@ $(BUILD_DIR)/gl-cache-repair.so: diagnostics/gl-cache-repair.cpp gl-state-cache.
 
 $(BUILD_DIR)/gl-state-cache-test: tests/gl-state-cache-test.cpp gl-state-cache.hpp native.cpp native.hpp | $(BUILD_DIR)
 	$(CXX) $(COMPILE_FLAGS) -I. $< native.cpp -lEGL -lGLESv2 -o $@
+
+$(BUILD_DIR)/transfer-timers.so: diagnostics/transfer-timers.cpp Makefile | require-diagnostics check-deps $(BUILD_DIR)
+	$(CXX) $(COMPILE_FLAGS) -shared -fPIC $(PACKAGE_CFLAGS) $< -o $@
+tools: $(BUILD_DIR)/transfer-timers.so
+
+$(BUILD_DIR)/retained-source-test: tests/retained-source-test.cpp transfer/retained-source.hpp transfer/protocol.hpp | $(BUILD_DIR)
+	$(CXX) $(COMPILE_FLAGS) -I. $(shell $(PKG_CONFIG) --cflags aquamarine pixman-1) $< -lhyprutils -o $@
+.PHONY: retained-source-check
+retained-source-check: $(BUILD_DIR)/retained-source-test
+	./$(BUILD_DIR)/retained-source-test
+check: retained-source-check

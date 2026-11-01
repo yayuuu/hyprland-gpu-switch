@@ -58,6 +58,7 @@
 #include "transfer/queued_state.hpp"
 #include "transfer/formats.hpp"
 #include "transfer/session-pool.hpp"
+#include "transfer/retained-source.hpp"
 #include "transfer/idle-policy.hpp"
 #include "probe.hpp"
 
@@ -106,6 +107,7 @@ struct SState {
         std::optional<Offload::GPUDevice> sourceGPU, rendererGPU;
         bool enabled = true;
         bool stopRequested = false;
+        std::string lastStopReason;
         bool eager = true;
         bool earlyRelease = false;
         unsigned profileRemaining = 0;
@@ -147,6 +149,7 @@ struct SState {
             std::optional<unsigned> slot;
             bool bound = false, nativeLayout = false;
             std::string layoutReason;
+            std::unique_ptr<Offload::RetainedSource> source;
         };
         std::map<Render::GL::CGLTexture*, SProxy> proxies;
         std::string layoutDiagnostic;
@@ -176,12 +179,14 @@ static void unwrapOffloadSurfaces(Render::CRenderContext& ctx, Render::CRenderPa
 static void preconvertCommittedFrame();
 static Render::CRenderContext* g_transferContext=nullptr;
 static Render::CRenderContext& transferContext() { return g_transferContext?*g_transferContext:g_pHyprRenderer->context(); }
+static Aquamarine::SDMABUFAttrs transferSourceAttributes(const SP<IHLBuffer>& buffer);
 static bool isProtectedInput(Render::ITexture* texture);
 static bool isNativeInput(Render::ITexture* texture);
 static std::string describeVramInput(Render::ITexture* texture);
 static void retainCaptureInput(const Hyprutils::OS::CFileDescriptor& fence, const CHLBufferReference& input);
 static void requestOffloadStop() {
     if (!g_state) return;
+    currentNV().lastStopReason = currentNV().reason;
     currentNV().stopRequested = true;
     if (g_state->offloadTimer) g_state->offloadTimer->updateTimeout(std::chrono::milliseconds(1));
 }
@@ -224,6 +229,7 @@ static void maintainOffload() {
         if (nv.client.running()) nv.client.checkReady();
         return;
     }
+    if(!nv.stopRequested)nv.lastStopReason=idle?"surface inactive or source output detached":"worker stopped";
     nv.stopRequested = true;
     setVramInputInactiveForSession(&nv);
     for (const auto& slot : nv.slots) {
@@ -282,6 +288,16 @@ static bool installProducerTracking() {
     g_state->producerTracking=true;return true;
 }
 
+static Aquamarine::SDMABUFAttrs transferSourceAttributes(const SP<IHLBuffer>& buffer) {
+    if(buffer && buffer->m_texture) {
+        const auto* texture=dynamic_cast<Render::GL::CGLTexture*>(buffer->m_texture.get());
+        const auto found=g_state->vram.proxies.find(const_cast<Render::GL::CGLTexture*>(texture));
+        if(found!=g_state->vram.proxies.end() && found->second.texture.lock()==buffer->m_texture && found->second.source)
+            return found->second.source->attrs;
+    }
+    return buffer?buffer->dmabuf():Aquamarine::SDMABUFAttrs{};
+}
+
 static bool materializeOffload(SState::SNVSlot& slot, NColorManagement::PImageDescription packed, Hyprutils::Math::eTransform transform) {
     auto fail = [&](const std::string& reason) { currentNV().reason = reason; currentNV().client.fail(reason); requestOffloadStop(); return false; };
     if (!slot.texture) {
@@ -336,12 +352,24 @@ static std::optional<PreparedTexture> prepareOffloadTexture(Render::CRenderConte
     static auto cmEnabled = CConfigValue<Config::INTEGER>("render:cm_enabled");
     const bool hdrConversion=*cmEnabled && !monitor->doesNoShaderCM() && monitor->m_imageDescription && monitor->m_imageDescription->value().transferFunction==NColorManagement::CM_TRANSFER_FUNCTION_ST2084_PQ;
     const auto pid = data.pWindow->backend().pid();
-    auto attrs = data.surface->m_current.buffer->dmabuf();
+    auto attrs = transferSourceAttributes(data.surface->m_current.buffer.m_buffer);
     if(!attrs.success)return std::nullopt;
     pid_t clientPID=0;wl_client_get_credentials(data.surface->client(),&clientPID,nullptr,nullptr);
     std::optional<Offload::GPUDevice> producer;
     auto cached=g_state->bufferProducers.find(data.surface->m_current.buffer.m_buffer.get());
     if(cached!=g_state->bufferProducers.end() && cached->second.buffer.lock()==data.surface->m_current.buffer.m_buffer)producer=cached->second.device;
+    if(!producer && data.surface->m_current.buffer->m_texture) {
+        const auto* texture=dynamic_cast<Render::GL::CGLTexture*>(data.surface->m_current.buffer->m_texture.get());
+        const auto proxy=g_state->vram.proxies.find(const_cast<Render::GL::CGLTexture*>(texture));
+        // Native allocations may lose generic fence/exporter provenance. Their
+        // construction was already scoped to this producer and inspected by
+        // the worker on that exact GPU. Retain that identity with the texture.
+        if(proxy!=g_state->vram.proxies.end() && proxy->second.texture.lock()==data.surface->m_current.buffer->m_texture && proxy->second.nativeLayout) {
+            const auto* origin=proxy->second.session;
+            if(origin && origin->identitySurface.lock()==data.surface && origin->identityWindow.lock()==data.pWindow)
+                producer=origin->sourceGPU;
+        }
+    }
     if(!producer) {
         Offload::FD provenanceFence;
         if(data.surface->m_current.acquire) {
@@ -360,6 +388,7 @@ static std::optional<PreparedTexture> prepareOffloadTexture(Render::CRenderConte
         g_state->reason=(!producer || !renderer)?"GPU provenance unavailable or ambiguous":"producer and compositor use the same GPU";
         return std::nullopt;
     }
+    g_state->reason="eligible cross-GPU surface";
     auto* selected=findSession(data.surface,data.pWindow);
     if(!selected){g_state->reason="surface session limit reached";return std::nullopt;}
     SessionScope selectedScope(selected);
@@ -757,18 +786,18 @@ void GpuSwitch::exitClientTransfer() {
 }
 
 static GpuSwitch::Json transferSessionStatus(const SState::SNV& nv) {
-    GpuSwitch::Json result={{"enabled",g_state->enabled},{"ready",nv.client.ready},{"reason",nv.reason},{"worker_reason",nv.client.reason},
+    GpuSwitch::Json result={{"enabled",g_state->enabled},{"ready",nv.client.ready},{"reason",nv.reason},{"worker_reason",nv.client.reason},{"eligibility_reason",g_state->reason},{"last_stop_reason",nv.lastStopReason},
         {"transport",nv.client.copyOnly?"gpu-copy":"pq10-convert"},{"worker",static_cast<unsigned long>(nv.client.workerPID)},
         {"pid",static_cast<unsigned long>(nv.ownerPID)},{"application",nv.identityWindow.lock()?nv.identityWindow.lock()->metadata().appID():""},
         {"source_gpu",nv.sourceGPU?nv.sourceGPU->id:""},{"renderer_gpu",nv.rendererGPU?nv.rendererGPU->id:""},
         {"keep_warm",workerCanStayWarm(nv,nv.owner.lock())},{"eager",nv.eager},{"pipelined_requested",nv.client.pipelined},{"pipelined_active",nv.client.ready && nv.client.pipelinedActive},
         {"prefer_local_input",nv.client.preferLocalInput},{"source_device_local",nv.client.sourceDeviceLocal},
         {"vram_input_auto",g_state->vram.automatic},{"vram_feedback",g_state->vram.session==&nv && g_state->vram.feedback},
-        {"vram_native_layout",g_state->vram.session==&nv && g_state->vram.nativeLayout},{"vram_error",g_state->vram.session==&nv?g_vramError:""}
+        {"vram_native_layout",g_state->vram.session==&nv && g_state->vram.nativeLayout},{"vram_error",(!g_state->vram.session || g_state->vram.session==&nv)?g_vramError:""}
 #if GPU_SWITCH_DIAGNOSTICS
         ,{"frames",nv.frames},{"reused",nv.reused},{"window_frames",nv.windowFrames},
         {"capture_frames",nv.captureFrames},{"eager_frames",nv.eagerFrames},
-        {"pending_inputs",g_state->retainedInputs.size()},{"protected_textures",g_state->vram.protectedTextures}
+        {"pending_inputs",g_state->retainedInputs.size()},{"protected_textures",g_state->vram.protectedTextures},{"vram_layout",g_state->vram.layoutDiagnostic}
 #endif
     };
     return result;
