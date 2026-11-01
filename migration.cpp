@@ -32,6 +32,7 @@
 #include <hyprland/src/state/MonitorState.hpp>
 #include <hyprland/src/debug/log/Logger.hpp>
 #include "migration.hpp"
+#include "gl-state-cache.hpp"
 #include "diagnostics/diagnostics.hpp"
 #include "native.hpp"
 #include "probe.hpp"
@@ -400,6 +401,7 @@ struct GLState {
         gl->m_currentProgram=0;gl->m_lastViewport.width=-1;
         gl->m_capStatus.fill(false);glDisable(GL_BLEND);glDisable(GL_SCISSOR_TEST);glDisable(GL_STENCIL_TEST);
         gl->m_blend=false;glUseProgram(0);
+        synchronizeGLStateCache(*gl);
     }
 };
 struct TextureStage {

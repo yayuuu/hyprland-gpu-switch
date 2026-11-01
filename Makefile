@@ -169,3 +169,9 @@ $(BUILD_DIR)/idle-policy-test: tests/idle-policy-test.cpp transfer/idle-policy.h
 idle-policy-check: $(BUILD_DIR)/idle-policy-test
 	./$(BUILD_DIR)/idle-policy-test
 check: idle-policy-check
+
+$(BUILD_DIR)/gl-cache-repair.so: diagnostics/gl-cache-repair.cpp gl-state-cache.hpp Makefile | require-diagnostics check-deps $(BUILD_DIR)
+	$(CXX) $(COMPILE_FLAGS) -shared -fPIC -fno-gnu-unique $(PACKAGE_CFLAGS) $< -lEGL -lGLESv2 -o $@
+
+$(BUILD_DIR)/gl-state-cache-test: tests/gl-state-cache-test.cpp gl-state-cache.hpp native.cpp native.hpp | $(BUILD_DIR)
+	$(CXX) $(COMPILE_FLAGS) -I. $< native.cpp -lEGL -lGLESv2 -o $@

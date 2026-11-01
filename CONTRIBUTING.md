@@ -152,3 +152,20 @@ reusing pointer-indexed records. Sessions with live protected proxies or pending
 source-release fences cannot be collected. The NVIDIA native-input feedback
 policy currently has one active producer claim; this does not limit ordinary
 cross-GPU copy sessions. Migration drains all workers before replacing GL state.
+
+After changes to context switching or renderer GL state caches, run the offscreen
+alpha regression test in both directions (using the appropriate render nodes):
+
+```sh
+make .build/release/gl-state-cache-test
+.build/release/gl-state-cache-test /dev/dri/renderD128 /dev/dri/renderD129
+.build/release/gl-state-cache-test /dev/dri/renderD129 /dev/dri/renderD128
+```
+
+It reproduces a stale blending cache producing opaque black pixels, verifies
+correct alpha blending after synchronization, and checks texture-unit, buffer
+and framebuffer cache identities on the resulting and return contexts.
+The optional `gl-cache-repair.so` diagnostic target requires `DIAGNOSTICS=1`.
+It reports cached versus actual blend factors through `hyprctl gpu-gl-cache`;
+`hyprctl gpu-gl-cache repair` performs a one-shot cache synchronization at the
+next render begin. It does not replace the migration plugin or its resources.
