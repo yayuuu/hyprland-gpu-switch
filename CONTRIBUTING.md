@@ -137,3 +137,5 @@ make gpu-transfer-test
 Append `copy`, `copy-tiled`, `copy8`, `copy8-tiled` or `copy10-tiled` to test native-format transport. Tiled cases require a source GPU supporting the requested modifier. Tests create offscreen buffers only and verify fences, color/alpha values and GL state restoration. They do not connect to Wayland or perform renderer migration.
 
 `make check` also tests producer provenance and borrowing unique-owned queued states without converting weak pointers to shared ownership. `hyprctl gpu-switch transfers` retains operational status in release builds and adds frame counters in diagnostic builds. Detailed worker output is compiled out by default.
+
+Output routes hold weak monitor references and retire buffers for destroyed or replaced outputs. A route must not extend a monitor's lifetime after the core clears `m_output`: late `wl_output` binds can otherwise reach a live monitor with no backing output. DPMS alone does not invalidate an attached output. The route-lifetime regression test covers these cases without connecting to a compositor.

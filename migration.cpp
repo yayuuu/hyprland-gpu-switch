@@ -377,6 +377,7 @@ static void collect() {
 }
 void GpuSwitch::maintainMigration() {
     if(preparing)return;
+    if(activeRoutes)activeRoutes->retireDisconnected();
     for(auto it=textures.begin();it!=textures.end();) {
         if(!it->second) {clientBridges.erase(it->first);dmaBuffers.erase(it->first);it=textures.erase(it);} else ++it;
     }

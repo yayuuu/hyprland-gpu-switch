@@ -133,3 +133,11 @@ transport-check: $(BUILD_DIR)/gpu-route-test $(BUILD_DIR)/queued-state-test
 
 gpu-transfer-test: $(BUILD_DIR)/cross-gpu-worker-test $(BUILD_DIR)/gpu-transfer-worker
 check: transport-check
+
+$(BUILD_DIR)/route-lifetime-test: tests/route-lifetime-test.cpp route-lifetime.hpp | $(BUILD_DIR)
+	$(CXX) $(COMPILE_FLAGS) -I. $< -lhyprutils -o $@
+
+.PHONY: route-lifetime-check
+route-lifetime-check: $(BUILD_DIR)/route-lifetime-test
+	./$(BUILD_DIR)/route-lifetime-test
+check: route-lifetime-check

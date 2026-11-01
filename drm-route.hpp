@@ -25,5 +25,6 @@ class DrmRoutes {
     int primaryFD() const;
     void beforeCommit(Monitor::CMonitor* monitor);
     void update(Monitor::CMonitor* monitor);
+    void retireDisconnected();
 };
 }

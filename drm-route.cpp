@@ -15,6 +15,7 @@
 #include "aq-transfer.hpp"
 #include "buffer-compat.hpp"
 #include "route-plan.hpp"
+#include "route-lifetime.hpp"
 #include "native.hpp"
 #include "probe.hpp"
 #include <sys/stat.h>
@@ -44,7 +45,7 @@ static void prepareCopy(const SP<CSwapchain>& render,const SP<CDRMBackend>& dest
 struct DrmRoutes::State {
     struct Node {SP<CDRMBackend> backend;std::string id;};
     struct Output {
-        PHLMONITOR monitor;
+        RouteMonitorRef<Monitor::CMonitor> monitor;
         SP<CDRMBackend> backend;
         SP<CSwapchain> render,scanout;
         SP<CDRMOutput> output;
@@ -74,7 +75,7 @@ struct DrmRoutes::State {
             if(!scanout || !scanout->reconfigure(options))throw std::runtime_error("Cannot allocate GPU-local scanout buffers");
             checkScanout(scanout,output);prepareCopy(render,backend);
         }
-        result={monitor->m_self.lock(),backend,render,scanout,output};
+        result={monitor->m_self,backend,render,scanout,output};
     }
 };
 DrmRoutes::DrmRoutes(const std::string& target):state_(std::make_unique<State>()) {
@@ -136,13 +137,17 @@ void DrmRoutes::commit() {
         o.output->mgpu.swapchain=o.scanout;
         o.output->mgpu.cursorSwapchain.reset();
         o.output->state->setBuffer(nullptr);o.output->state->resetExplicitFences();
-        if(o.monitor)o.monitor->m_inFence.reset();
+        if(auto monitor=o.monitor.lock())monitor->m_inFence.reset();
     }
     s.active=true;
+}
+void DrmRoutes::retireDisconnected() {
+    retireDisconnectedRoutes(state_->outputs);
 }
 void DrmRoutes::update(Monitor::CMonitor* monitor) {
     auto& s=*state_;
     if(!s.active || !monitor || !monitor->m_output || !monitor->m_enabled)return;
+    retireDisconnected();
     auto it=std::ranges::find_if(s.outputs,[&](const auto& o){return o.monitor.get()==monitor;});
     if(it==s.outputs.end()) {
         auto backend=dynamicPointerCast<CDRMBackend>(monitor->m_output->getBackend());
