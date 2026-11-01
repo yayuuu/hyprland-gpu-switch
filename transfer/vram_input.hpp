@@ -35,9 +35,10 @@ static std::string describeVramInput(Render::ITexture* texture) {
 }
 
 static void vramBufferConstructor(void* object, uint32_t id, wl_client* client, const Aquamarine::SDMABUFAttrs& attrs) {
+    SessionScope selected(g_state?g_state->vram.session:nullptr);
     pid_t pid = 0; wl_client_get_credentials(client, &pid, nullptr, nullptr);
     const bool previous = g_vramConstructing;
-    g_vramConstructing = g_state && g_state->vram.protectNew && pid == g_state->vram.pid && g_state->nv.sourceGPU && Offload::exporterDriver(g_state->nv.sourceGPU->driver)=="nvidia";
+    g_vramConstructing = g_state && g_state->vram.protectNew && pid == g_state->vram.pid && currentNV().sourceGPU && Offload::exporterDriver(currentNV().sourceGPU->driver)=="nvidia";
     Render::CScopeGuard restore([&] { g_vramConstructing = previous; });
     using F = void (*)(void*, uint32_t, wl_client*, const Aquamarine::SDMABUFAttrs&);
     reinterpret_cast<F>(g_vramCtorHook->m_original)(object, id, client, attrs);
@@ -50,7 +51,7 @@ static SP<Render::ITexture> vramCreateTexture(void* renderer, const Aquamarine::
     }
     // Query mapping compatibility on the NVIDIA worker before touching EGL.
     // Ordinary shared/Intel buffers keep the native texture alias and fallback.
-    const auto local = g_state->nv.client.inspectSource(attrs.fds[0]);
+    const auto local = currentNV().client.inspectSource(attrs.fds[0]);
     if (local && !*local) {
         return g_vramCreateOriginal(renderer, attrs, opaque);
     }
@@ -77,6 +78,8 @@ static void vramBind(Render::GL::CGLTexture* texture) {
     auto found = g_state->vram.proxies.find(texture);
     if (found == g_state->vram.proxies.end()) { original(texture); return; }
     auto& proxy = found->second;
+    if(!proxy.session){original(texture);return;}
+    SessionScope selected(proxy.session);
     if (proxy.texture.expired()) { g_state->vram.proxies.erase(found); original(texture); return; }
     auto& state = g_state->vram;
     state.insideBind = true;
@@ -84,20 +87,19 @@ static void vramBind(Render::GL::CGLTexture* texture) {
     proxy.savedDescription = texture->m_imageDescription;
     proxy.bound = true;
     proxy.slot.reset();
-    const auto owner = state.owner.lock();
-    const auto surface = state.surface.lock();
+    const auto owner = currentNV().owner.lock();
+    const auto surface = currentNV().sourceSurface.lock();
     const auto monitor = owner ? owner->m_monitor.lock() : nullptr;
     if (owner && owner->m_isMapped && surface && surface->m_current.buffer && monitor &&
-        g_state->enabled && g_state->nv.enabled) {
+        g_state->enabled && currentNV().enabled) {
         CSurfacePassElement::SRenderData data{};
         data.surface = surface; data.texture = surface->m_current.texture; data.pWindow = owner;
         CSurfacePassElement element{data};
         if (auto ready = prepareOffloadTexture(element, monitor, false)) {
-            proxy.slot = ready;
-            state.safeTexture = g_state->nv.slots[*ready].texture;
+            proxy.slot = ready->slot;
         }
     }
-    auto safe = state.safeTexture;
+    auto safe = currentNV().cachedSlot?currentNV().slots[*currentNV().cachedSlot].texture:SP<Render::ITexture>{};
     if (safe && safe->ok()) {
         auto& rd = g_pHyprRenderer->m_renderData;
         if (surface && monitor && rd.currentFB && surface->m_colorManagement.valid()) {
@@ -117,8 +119,8 @@ static void vramBind(Render::GL::CGLTexture* texture) {
         }
         texture->m_imageDescription = safe->m_imageDescription;
         texture->m_cachedStates.fill(std::nullopt);
-        if (!proxy.slot) for (unsigned i = 0; i < g_state->nv.slots.size(); ++i)
-            if (g_state->nv.slots[i].texture == safe) { proxy.slot = i; break; }
+        if (!proxy.slot) for (unsigned i = 0; i < currentNV().slots.size(); ++i)
+            if (currentNV().slots[i].texture == safe) { proxy.slot = i; break; }
         // bind() precedes renderToFBInternal(), which reads this description.
         // Parameters set through the proxy apply to the currently bound result.
         safe->bind();
@@ -136,9 +138,10 @@ static void vramUnbind(Render::GL::CGLTexture* texture) {
     auto found = g_state->vram.proxies.find(texture);
     if (found == g_state->vram.proxies.end() || !found->second.bound) return;
     auto& proxy = found->second;
-    if (proxy.slot && g_state->nv.client.ready && g_state->nv.enabled && !g_state->nv.stopRequested) {
+    SessionScope selected(proxy.session);
+    if (proxy.slot && currentNV().client.ready && currentNV().enabled && !currentNV().stopRequested) {
         auto fence = g_pHyprRenderer->createSyncFDManager();
-        if (fence && fence->isValid()) g_state->nv.slots[*proxy.slot].readComplete.reset(fence->takeFd().take());
+        if (fence && fence->isValid()) currentNV().slots[*proxy.slot].readComplete.reset(fence->takeFd().take());
         else { glFinish(); requestOffloadStop(); }
     }
     if (proxy.savedCMCache) { g_pHyprRenderer->m_cmSettingsCache = std::move(*proxy.savedCMCache); proxy.savedCMCache.reset(); }
@@ -194,6 +197,7 @@ static bool installVramHook(CFunctionHook*& hook, const std::string& name, const
 static bool setVramInput(bool enable, bool native = false) {
     if (!g_state) return false;
     auto& state = g_state->vram;
+    if(enable && state.session && state.session!=&currentNV())return false;
     if (!enable) {
         state.feedback = false;
         if (PROTO::linuxDma) for (const auto& feedback : PROTO::linuxDma->m_feedbacks)
@@ -201,11 +205,11 @@ static bool setVramInput(bool enable, bool native = false) {
         // Keep protecting already-created source textures until they retire.
         return true;
     }
-    if(g_state->nv.client.copyOnly || !g_state->nv.sourceGPU || Offload::exporterDriver(g_state->nv.sourceGPU->driver)!="nvidia")
+    if(currentNV().client.copyOnly || !currentNV().sourceGPU || Offload::exporterDriver(currentNV().sourceGPU->driver)!="nvidia")
         { g_vramError="native NVIDIA input requires a confirmed NVIDIA producer";return false; }
-    if (!g_state->enabled || !g_state->nv.enabled || !g_state->nv.client.ready || !g_state->nv.flag ||
-        g_state->nv.sourceSurface.expired() || !PROTO::linuxDma)
-        { g_vramError = std::format("prerequisites enabled={} nv={} ready={} flag={} owner={} surface={} protocol={}", g_state->enabled, g_state->nv.enabled, g_state->nv.client.ready, g_state->nv.flag, g_state->nv.ownerPID, !g_state->nv.sourceSurface.expired(), bool(PROTO::linuxDma)); return false; }
+    if (!g_state->enabled || !currentNV().enabled || !currentNV().client.ready || !currentNV().flag ||
+        currentNV().sourceSurface.expired() || !PROTO::linuxDma)
+        { g_vramError = std::format("prerequisites enabled={} nv={} ready={} flag={} owner={} surface={} protocol={}", g_state->enabled, currentNV().enabled, currentNV().client.ready, currentNV().flag, currentNV().ownerPID, !currentNV().sourceSurface.expired(), bool(PROTO::linuxDma)); return false; }
     if (state.feedback) { if (state.nativeLayout != native) { g_vramError = "Disable VRAM input before changing its layout"; return false; } return true; }
     dev_t device = 0;
     for (const auto& node : std::filesystem::directory_iterator("/sys/class/drm")) {
@@ -221,9 +225,10 @@ static bool setVramInput(bool enable, bool native = false) {
         !installVramHook(g_vramUnbindHook, "unbind", "Render::GL::CGLTexture::unbind()", reinterpret_cast<void*>(&vramUnbind)) ||
         !installVramHook(g_vramFeedbackHook, "sendDefaultFeedback", "CLinuxDMABUFFeedbackResource::sendDefaultFeedback()", reinterpret_cast<void*>(&vramDefaultFeedback)))
         return false;
-    state.pid = g_state->nv.ownerPID; state.owner = g_state->nv.owner; state.surface = g_state->nv.sourceSurface;
+    state.session=&currentNV();
+    state.pid = currentNV().ownerPID; state.owner = currentNV().owner; state.surface = currentNV().sourceSurface;
     state.device = device; state.protectNew = true; state.nativeLayout = native;
-    if (g_state->nv.cachedSlot) state.safeTexture = g_state->nv.slots[*g_state->nv.cachedSlot].texture;
+    if (currentNV().cachedSlot) state.safeTexture = currentNV().slots[*currentNV().cachedSlot].texture;
     state.feedback = true;
     const auto before = state.feedbackSent;
     for (const auto& feedback : PROTO::linuxDma->m_feedbacks) sendVramFeedback(feedback.get());
@@ -234,9 +239,11 @@ static bool setVramInput(bool enable, bool native = false) {
 // Runs on the existing idle timer, after ordinary offload has produced a
 // materialized frame. This never creates an NVIDIA context on the desktop.
 static void updateAutomaticVramInput() {
-    if (!g_state || !g_state->vram.automatic || !g_state->enabled || !g_state->nv.enabled) return;
+    if (!g_state || !g_state->vram.automatic || !g_state->enabled || !currentNV().enabled) return;
+    if(currentNV().client.copyOnly || !currentNV().sourceGPU || Offload::exporterDriver(currentNV().sourceGPU->driver)!="nvidia")return;
+    if(g_state->vram.session && g_state->vram.session!=&currentNV())return;
     auto& state = g_state->vram;
-    const auto& nv = g_state->nv;
+    const auto& nv = currentNV();
     const auto now = std::chrono::steady_clock::now();
     if (nv.stopRequested || !nv.client.ready || !nv.cachedSlot || !nv.slots[*nv.cachedSlot].texture ||
         now - nv.lastDraw > std::chrono::milliseconds(250) || now < state.retryAfter) return;
@@ -250,5 +257,19 @@ static void stopVramInput() {
     setVramInput(false);
     removeVramHook(g_vramFeedbackHook); removeVramHook(g_vramUnbindHook);
     removeVramHook(g_vramCtorHook);
-    g_state->vram.proxies.clear(); g_state->vram.safeTexture.reset();
+    g_state->vram.proxies.clear(); g_state->vram.safeTexture.reset();g_state->vram.session=nullptr;
+}
+
+static void setVramInputInactiveForSession(SState::SNV* session){
+    if(g_state && g_state->vram.session==session && g_state->vram.feedback)setVramInput(false);
+}
+
+// A retired producer must not hold the global feedback claim forever. Existing
+// protected textures keep their session identity until their weak handles die.
+static void retireVramSession() {
+    auto& state=g_state->vram;
+    if(!state.session || state.feedback || state.session->client.running())return;
+    if(std::ranges::any_of(state.proxies,[&](const auto& entry){return entry.second.session==state.session;}))return;
+    state.safeTexture.reset();state.owner.reset();state.surface.reset();state.pid=0;
+    state.protectNew=false;state.nativeLayout=false;state.session=nullptr;
 }

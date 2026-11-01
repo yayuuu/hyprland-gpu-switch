@@ -153,3 +153,19 @@ check: rendering-policy-check
 $(BUILD_DIR)/frame-cadence-probe.so: diagnostics/frame-cadence.cpp transfer/queued_state.hpp Makefile | require-diagnostics check-deps $(BUILD_DIR)
 	$(CXX) $(COMPILE_FLAGS) -shared -fPIC -fno-gnu-unique $(PACKAGE_CFLAGS) $< -o $@
 tools: $(BUILD_DIR)/frame-cadence-probe.so
+
+$(BUILD_DIR)/session-pool-test: tests/session-pool-test.cpp transfer/session-pool.hpp | $(BUILD_DIR)
+	$(CXX) $(COMPILE_FLAGS) $< -o $@
+
+.PHONY: session-pool-check
+session-pool-check: $(BUILD_DIR)/session-pool-test
+	./$(BUILD_DIR)/session-pool-test
+check: session-pool-check
+
+$(BUILD_DIR)/idle-policy-test: tests/idle-policy-test.cpp transfer/idle-policy.hpp | $(BUILD_DIR)
+	$(CXX) $(COMPILE_FLAGS) $< -o $@
+
+.PHONY: idle-policy-check
+idle-policy-check: $(BUILD_DIR)/idle-policy-test
+	./$(BUILD_DIR)/idle-policy-test
+check: idle-policy-check

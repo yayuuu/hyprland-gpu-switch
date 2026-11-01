@@ -1,6 +1,6 @@
 #pragma once
 #if GPU_SWITCH_DIAGNOSTICS
-#define GPU_SWITCH_VERSION "0.6.0-diag"
+#define GPU_SWITCH_VERSION "0.7.1-diag"
 #else
-#define GPU_SWITCH_VERSION "0.6.0"
+#define GPU_SWITCH_VERSION "0.7.1"
 #endif

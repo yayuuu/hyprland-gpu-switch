@@ -143,3 +143,12 @@ Append `copy`, `copy-tiled`, `copy8`, `copy8-tiled` or `copy10-tiled` to test na
 Output routes hold weak monitor references and retire buffers for destroyed or replaced outputs. A route must not extend a monitor's lifetime after the core clears `m_output`: late `wl_output` binds can otherwise reach a live monitor with no backing output. DPMS alone does not invalidate an attached output. The route-lifetime regression test covers these cases without connecting to a compositor.
 
 The rendering-policy test checks every fullscreen safety gate and unique-owned capture-frame lifetime. `make DIAGNOSTICS=1 tools` also builds `frame-cadence-probe.so`, an opt-in event-listener probe for client commits, rendering and presentation cadence. It does not modify rendering and is not loaded automatically. Timing traces and GPU query profiling require a diagnostic build; normal builds retain operational optimization status.
+
+Transport sessions use stable heap addresses keyed by weak surface and window
+identities, rather than PID alone (one process can own multiple windows).
+Worker IPC, generation caches, output slots and fences belong to each session.
+Producer provenance remains shared and validates weak buffer identity before
+reusing pointer-indexed records. Sessions with live protected proxies or pending
+source-release fences cannot be collected. The NVIDIA native-input feedback
+policy currently has one active producer claim; this does not limit ordinary
+cross-GPU copy sessions. Migration drains all workers before replacing GL state.

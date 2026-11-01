@@ -22,6 +22,11 @@ static HANDLE handle=nullptr;
 static SP<CEventLoopTimer> timer;
 static SP<SHyprCtlCommand> command;
 static GpuSwitch::Roles roles;
+GpuSwitch::Role GpuSwitch::knownGpuRole(const std::string& pciId) {
+    for(const auto& [path,info]:roles)
+        if(std::filesystem::path(path).filename()==pciId)return info.role;
+    return Role::Unknown;
+}
 static GpuSwitch::Json report;
 static std::string previousTopology;
 static std::optional<std::string> candidate;

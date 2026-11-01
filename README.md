@@ -31,11 +31,11 @@ Other supported buffers use native-format copying. Already-PQ content is not con
 - Uses native fences for source acquisition, conversion completion, compositor sampling and output-slot reuse. Source buffers remain retained until the GPU has finished reading them.
 - Starts preprocessing on source commits when possible, reuses three output slots and reserves capacity across ordinary window resizes. Where supported, row-band pipelining overlaps transfer and conversion; other queue configurations use the serial GPU path.
 - Preserves specialized device-local input handling for confirmed NVIDIA producers without applying it to buffers from unrelated drivers.
-- Starts the helper on demand and stops it after idle work has drained. Before renderer migration, worker submissions and transport resources are drained; imports and tracking are recreated for the resulting renderer, including rollback.
+- Starts helpers on demand and keeps them ready across workspace changes without copying inactive content. Stops helpers when their windows close or the relevant GPU is no longer needed, after outstanding work has drained. Before renderer migration, worker submissions and transport resources are drained; imports and tracking are recreated for the resulting renderer, including rollback.
 
 ### Scope and limitations
 
-The current worker handles one application surface at a time. Multiple competing surfaces can fall back to normal rendering; a per-surface worker pool is not implemented. Unsupported formats and layouts retain the compositor's fallback behavior. Transport does not move application rendering or video decoding to another GPU.
+Each eligible application surface has an independent, on-demand worker session with its own three output buffers, frame cache and synchronization fences. Up to 16 workers may run concurrently; additional surfaces retain normal compositor rendering. Workers remain ready while their windows are hidden on another workspace, without copying inactive content. They retain their contexts and buffers to avoid repeated startup stalls. Closing a window or turning all displays off drains and stops its worker. A worker on a discrete source GPU also stops when that GPU no longer has an active output, allowing it to suspend. Renderer migration drains all workers, and expired sessions are retired. Unsupported formats and layouts retain the compositor's fallback behavior. Transport does not move application rendering or video decoding to another GPU.
 
 The worker executable and compute shader are embedded in the plugin, so no separate helper installation is needed. Detailed worker diagnostics are disabled in the normal build. Use `hyprctl gpu-switch transfers` to inspect the active route and transport mode (`gpu-copy` or `pq10-convert`).
 
@@ -142,7 +142,7 @@ Automatic switching starts when the plugin loads. No separate enable command is 
 | `hyprctl gpu-switch rendering off` | Disable fullscreen optimizations while retaining transport and capture pacing |
 | `hyprctl gpu-switch rendering capture-pacing-off` | Disable capture pacing for the session |
 | `hyprctl gpu-switch rendering capture-pacing-on` | Restore capture pacing (default) |
-| `hyprctl gpu-switch transfers` | Show client transport readiness, mode and GPU route |
+| `hyprctl gpu-switch transfers` | Show per-surface workers, readiness, mode and GPU routes |
 | `hyprctl gpu-switch retry` | Clear a migration error and allow another attempt |
 
 Disabling switching leaves the current renderer in place. Cross-GPU client transport remains active independently. After a migration, the plugin keeps live GPU resources and cannot be unloaded safely within that session.
