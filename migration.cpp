@@ -1,3 +1,4 @@
+#include "rendering-optimizations.hpp"
 #include "client-transfer.hpp"
 #include <bits/stdc++.h>
 #include <hyprgraphics/egl/Egl.hpp>
@@ -214,10 +215,11 @@ static SP<ITexture> texPixels(void* self,uint32_t f,uint8_t* p,uint32_t stride,c
     return track(reinterpret_cast<SP<ITexture>(*)(void*,uint32_t,uint8_t*,uint32_t,const Vector2D&,bool,bool)>(texPixelsHook->m_original)(self,f,p,stride,size,copy,opaque));
 }
 static SP<ITexture> texDma(void* self,const Aquamarine::SDMABUFAttrs& a,bool opaque) {
-    SP<ITexture> t;
-    if(origins.empty() || matchesFormat(g_pHyprOpenGL->m_drmFormats,a))
+    bool handled=false;
+    auto t=GpuSwitch::createClientTransferTexture(self,a,opaque,reinterpret_cast<GpuSwitch::TransferTextureFactory>(texDmaHook->m_original),handled);
+    if(!handled && (origins.empty() || matchesFormat(g_pHyprOpenGL->m_drmFormats,a)))
         t=reinterpret_cast<SP<ITexture>(*)(void*,const Aquamarine::SDMABUFAttrs&,bool)>(texDmaHook->m_original)(self,a,opaque);
-    if(!t && !preparing && !origins.empty()) {
+    if(!handled && !t && !preparing && !origins.empty()) {
         try {
             auto source=importAtOrigin(a);
             auto description=source->read(false);
@@ -251,6 +253,7 @@ std::string GpuSwitch::bridgeStatus() {
 }
 #endif
 static void bindTexture(CGLTexture* self) {
+    if(GpuSwitch::bindClientTransferTexture(self,reinterpret_cast<GpuSwitch::TransferTextureBind>(bindTextureHook->m_original)))return;
     if(auto it=clientBridges.find(self);it!=clientBridges.end() && it->second.texture && !preparing) {
         if(!it->second.eventDriven && PROTO::compositor)PROTO::compositor->forEachSurface([&](SP<CWLSurfaceResource> surface) {
             if(surface->m_current.texture.get()==self)it->second.eventDriven=true;
@@ -507,9 +510,9 @@ std::string GpuSwitch::migrate(const std::string& id,const std::function<bool()>
     // Resume only after all migration guards have restored the final context.
     struct TransferReset {
         HANDLE handle;
-        explicit TransferReset(HANDLE h):handle(h){GpuSwitch::exitClientTransfer();}
-        ~TransferReset(){try{GpuSwitch::initClientTransfer(handle);}catch(const std::exception& e){
-            GpuSwitch::exitClientTransfer();Log::logger->log(Log::ERR,"[gpu-switch] Cannot restore client transport: {}",e.what());}}
+        explicit TransferReset(HANDLE h):handle(h){GpuSwitch::exitRenderingOptimizations();GpuSwitch::exitClientTransfer();}
+        ~TransferReset(){try{GpuSwitch::initClientTransfer(handle);GpuSwitch::initRenderingOptimizations(handle);}catch(const std::exception& e){
+            GpuSwitch::exitRenderingOptimizations();GpuSwitch::exitClientTransfer();Log::logger->log(Log::ERR,"[gpu-switch] Cannot restore client transport: {}",e.what());}}
     } transferReset(pluginHandle);
     // Release extension-owned rendering resources through the compositor lifecycle.
     struct PluginReset {

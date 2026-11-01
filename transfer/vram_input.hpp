@@ -4,8 +4,10 @@
 // This file is included after prepareOffloadTexture. All hooks run on the
 // compositor's event-loop thread. Core-owned CGLTexture objects are used so
 // protected buffers never retain a plugin vtable after unloading.
-static CFunctionHook *g_vramCtorHook = nullptr, *g_vramCreateHook = nullptr;
-static CFunctionHook *g_vramBindHook = nullptr, *g_vramUnbindHook = nullptr, *g_vramFeedbackHook = nullptr;
+static CFunctionHook *g_vramCtorHook = nullptr;
+static GpuSwitch::TransferTextureFactory g_vramCreateOriginal=nullptr;
+static GpuSwitch::TransferTextureBind g_vramBindOriginal=nullptr;
+static CFunctionHook *g_vramUnbindHook = nullptr, *g_vramFeedbackHook = nullptr;
 static thread_local bool g_vramConstructing = false;
 static std::string g_vramError;
 
@@ -44,15 +46,13 @@ static void vramBufferConstructor(void* object, uint32_t id, wl_client* client, 
 static SP<Render::ITexture> vramCreateTexture(void* renderer, const Aquamarine::SDMABUFAttrs& attrs, bool opaque) {
     if (!g_vramConstructing || !g_state || attrs.planes != 1 || attrs.modifier != DRM_FORMAT_MOD_LINEAR ||
         (attrs.format != DRM_FORMAT_XBGR16161616F && attrs.format != DRM_FORMAT_ABGR16161616F)) {
-        using F = SP<Render::ITexture> (*)(void*, const Aquamarine::SDMABUFAttrs&, bool);
-        return reinterpret_cast<F>(g_vramCreateHook->m_original)(renderer, attrs, opaque);
+        return g_vramCreateOriginal(renderer, attrs, opaque);
     }
     // Query mapping compatibility on the NVIDIA worker before touching EGL.
     // Ordinary shared/Intel buffers keep the native texture alias and fallback.
     const auto local = g_state->nv.client.inspectSource(attrs.fds[0]);
     if (local && !*local) {
-        using F = SP<Render::ITexture> (*)(void*, const Aquamarine::SDMABUFAttrs&, bool);
-        return reinterpret_cast<F>(g_vramCreateHook->m_original)(renderer, attrs, opaque);
+        return g_vramCreateOriginal(renderer, attrs, opaque);
     }
     // Never import the source FD into Intel EGL. A real core texture with a
     // safe one-pixel backing also makes teardown/failure paths harmless.
@@ -72,8 +72,7 @@ static SP<Render::ITexture> vramCreateTexture(void* renderer, const Aquamarine::
 }
 
 static void vramBind(Render::GL::CGLTexture* texture) {
-    using F = void (*)(Render::GL::CGLTexture*);
-    const auto original = reinterpret_cast<F>(g_vramBindHook->m_original);
+    const auto original = g_vramBindOriginal;
     if (!g_state || g_state->vram.insideBind) { original(texture); return; }
     auto found = g_state->vram.proxies.find(texture);
     if (found == g_state->vram.proxies.end()) { original(texture); return; }
@@ -219,8 +218,6 @@ static bool setVramInput(bool enable, bool native = false) {
     }
     if (!device) { g_vramError = "no NVIDIA render node"; return false; }
     if (!installVramHook(g_vramCtorHook, "CDMABuffer", "CDMABuffer::CDMABuffer(unsigned int, wl_client*, Aquamarine::SDMABUFAttrs const&)", reinterpret_cast<void*>(&vramBufferConstructor)) ||
-        !installVramHook(g_vramCreateHook, "createTexture", "Render::GL::CHyprGLRenderer::createTexture(Aquamarine::SDMABUFAttrs const&, bool)", reinterpret_cast<void*>(&vramCreateTexture)) ||
-        !installVramHook(g_vramBindHook, "bind", "Render::GL::CGLTexture::bind()", reinterpret_cast<void*>(&vramBind)) ||
         !installVramHook(g_vramUnbindHook, "unbind", "Render::GL::CGLTexture::unbind()", reinterpret_cast<void*>(&vramUnbind)) ||
         !installVramHook(g_vramFeedbackHook, "sendDefaultFeedback", "CLinuxDMABUFFeedbackResource::sendDefaultFeedback()", reinterpret_cast<void*>(&vramDefaultFeedback)))
         return false;
@@ -251,7 +248,7 @@ static void updateAutomaticVramInput() {
 static void stopVramInput() {
     if (!g_state) return;
     setVramInput(false);
-    removeVramHook(g_vramFeedbackHook); removeVramHook(g_vramUnbindHook); removeVramHook(g_vramBindHook);
-    removeVramHook(g_vramCreateHook); removeVramHook(g_vramCtorHook);
+    removeVramHook(g_vramFeedbackHook); removeVramHook(g_vramUnbindHook);
+    removeVramHook(g_vramCtorHook);
     g_state->vram.proxies.clear(); g_state->vram.safeTexture.reset();
 }

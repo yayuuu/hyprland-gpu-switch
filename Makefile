@@ -21,7 +21,7 @@ PACKAGES = hyprland aquamarine hyprutils pixman-1 libdrm pangocairo libinput lib
 PACKAGE_CFLAGS = $(shell $(PKG_CONFIG) --cflags $(PACKAGES))
 PACKAGE_LIBS = $(shell $(PKG_CONFIG) --libs $(PACKAGES))
 COMPILE_FLAGS = $(CPPFLAGS) -DGPU_SWITCH_DIAGNOSTICS=$(DIAGNOSTICS) $(CXXFLAGS) $(STANDARD_FLAGS)
-SOURCES = client-transfer.cpp transfer/embedded.cpp transfer/worker-blob.S main.cpp probe.cpp migration.cpp drm-route.cpp aq-transfer.cpp native.cpp
+SOURCES = rendering-optimizations.cpp client-transfer.cpp transfer/embedded.cpp transfer/worker-blob.S main.cpp probe.cpp migration.cpp drm-route.cpp aq-transfer.cpp native.cpp
 ifeq ($(DIAGNOSTICS),1)
 SOURCES += diagnostics/diagnostics.cpp
 endif
@@ -141,3 +141,15 @@ $(BUILD_DIR)/route-lifetime-test: tests/route-lifetime-test.cpp route-lifetime.h
 route-lifetime-check: $(BUILD_DIR)/route-lifetime-test
 	./$(BUILD_DIR)/route-lifetime-test
 check: route-lifetime-check
+
+$(BUILD_DIR)/rendering-policy-test: tests/rendering-policy-test.cpp singlepass-policy.hpp capture-wait.hpp | $(BUILD_DIR)
+	$(CXX) $(COMPILE_FLAGS) -I. $< -lhyprutils -o $@
+
+.PHONY: rendering-policy-check
+rendering-policy-check: $(BUILD_DIR)/rendering-policy-test
+	./$(BUILD_DIR)/rendering-policy-test
+check: rendering-policy-check
+
+$(BUILD_DIR)/frame-cadence-probe.so: diagnostics/frame-cadence.cpp transfer/queued_state.hpp Makefile | require-diagnostics check-deps $(BUILD_DIR)
+	$(CXX) $(COMPILE_FLAGS) -shared -fPIC -fno-gnu-unique $(PACKAGE_CFLAGS) $< -o $@
+tools: $(BUILD_DIR)/frame-cadence-probe.so

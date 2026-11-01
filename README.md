@@ -39,6 +39,18 @@ The current worker handles one application surface at a time. Multiple competing
 
 The worker executable and compute shader are embedded in the plugin, so no separate helper installation is needed. Detailed worker diagnostics are disabled in the normal build. Use `hyprctl gpu-switch transfers` to inspect the active route and transport mode (`gpu-copy` or `pq10-convert`).
 
+## HDR fullscreen rendering
+
+Eligible opaque fullscreen HDR surfaces use a single rendering pass directly into the monitor's 10-bit output buffer, avoiding an intermediate FP16 work buffer and the final extra conversion pass. This is compositor rendering, not direct scanout. It works on compatible HDR outputs regardless of connector name and does not require a previous GPU migration.
+
+The path validates opacity, full damage, color conversion, output format, scale and transform. Overlays, postprocessing, incompatible input color spaces, mirroring or capture that requires the work buffer retain ordinary composition. A small software-cursor region is reconstructed separately to preserve blending in linear light. Optional specialized/PQ lookup shaders are available; the default uses the stock color shader.
+
+## Recording and VRR
+
+Capture pacing coalesces screen-sharing requests with genuine content updates instead of scheduling an extra output redraw for every request. A 25 ms deadline restores ordinary damage scheduling if content stops updating. Capture requiring an intermediate buffer automatically disables the fullscreen shortcut. Cached-mirror delivery is available as an optional mode and is disabled by default.
+
+VRR capability handling validates the connector's actual DRM properties and corrects stale capability caches. These features preserve the configured VRR policy; they do not force a different refresh mode. Timing, worker transport and fullscreen rendering are managed by this plugin and operate independently of automatic renderer switching.
+
 ## Requirements
 
 This version targets **Hyprland 0.56.2** (`efb50993780079460b0cbed1363e2166a2de1d9f`) and **Aquamarine 0.15.1**. Development headers must match the installed compositor and libraries. Other versions require compatibility work.
@@ -125,6 +137,11 @@ Automatic switching starts when the plugin loads. No separate enable command is 
 | `hyprctl gpu-switch status` | Show the actual renderer, target GPU and migration state |
 | `hyprctl gpu-switch disable` | Pause automatic switching for this session |
 | `hyprctl gpu-switch enable` | Resume automatic switching |
+| `hyprctl gpu-switch rendering` | Show fullscreen rendering, capture pacing and fallback status |
+| `hyprctl gpu-switch rendering on` | Enable eligible fullscreen optimizations (default) |
+| `hyprctl gpu-switch rendering off` | Disable fullscreen optimizations while retaining transport and capture pacing |
+| `hyprctl gpu-switch rendering capture-pacing-off` | Disable capture pacing for the session |
+| `hyprctl gpu-switch rendering capture-pacing-on` | Restore capture pacing (default) |
 | `hyprctl gpu-switch transfers` | Show client transport readiness, mode and GPU route |
 | `hyprctl gpu-switch retry` | Clear a migration error and allow another attempt |
 

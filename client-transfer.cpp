@@ -28,6 +28,7 @@
 #include <hyprland/src/pointer/PointerManager.hpp>
 #include <hyprland/src/plugins/PluginAPI.hpp>
 #include "client-transfer.hpp"
+#include "rendering-optimizations.hpp"
 #include <hyprland/src/plugins/PluginSystem.hpp>
 #include <dlfcn.h>
 #include "version.hpp"
@@ -204,6 +205,8 @@ static void observeProducerSurface(SP<CWLSurfaceResource> surface) {
         if(!g_state || !surface || !state || !state->buffer)return;
         const auto attrs=state->buffer->dmabuf();
         if(!attrs.success || attrs.planes!=1 || !Offload::transportFormat(attrs.format))return;
+        const auto known=g_state->bufferProducers.find(state->buffer.m_buffer.get());
+        if(known!=g_state->bufferProducers.end() && known->second.buffer.lock()==state->buffer.m_buffer)return;
         Offload::FD acquire;if(state->acquire){auto fd=state->acquire.exportAsFD();if(fd.isValid())acquire.reset(fd.take());}
         pid_t pid=0;wl_client_get_credentials(surface->client(),&pid,nullptr,nullptr);
         auto producer=Offload::producerDevice(attrs.fds[0],pid,acquire.value);
@@ -293,6 +296,11 @@ static std::optional<unsigned> prepareOffloadTexture(CSurfacePassElement& elemen
             if(exported.isValid())provenanceFence.reset(exported.take());
         }
         producer=Offload::producerDevice(attrs.fds[0],clientPID,provenanceFence.value);
+    }
+    if(producer && (cached==g_state->bufferProducers.end() || cached->second.buffer.lock()!=data.surface->m_current.buffer.m_buffer)) {
+        std::erase_if(g_state->bufferProducers,[](const auto& entry){return entry.second.buffer.expired();});
+        if(g_state->bufferProducers.size()>=512)g_state->bufferProducers.erase(g_state->bufferProducers.begin());
+        g_state->bufferProducers[data.surface->m_current.buffer.m_buffer.get()]={data.surface->m_current.buffer.m_buffer,*producer};
     }
     const auto renderer=Offload::rendererDevice(g_pCompositor->m_drmRenderNode.fd);
     if(!producer || !renderer || producer->id==renderer->id) {
@@ -436,6 +444,22 @@ static std::optional<unsigned> prepareOffloadTexture(CSurfacePassElement& elemen
 }
 
 #include "transfer/vram_input.hpp"
+
+// Share migration's existing core hooks rather than registering a second hook
+// on createTexture/bind, which stock Hyprland explicitly rejects.
+SP<Render::ITexture> GpuSwitch::createClientTransferTexture(void* self,const Aquamarine::SDMABUFAttrs& attrs,bool opaque,TransferTextureFactory original,bool& handled) {
+    handled=g_state && g_vramConstructing && attrs.planes==1 && attrs.modifier==DRM_FORMAT_MOD_LINEAR &&
+        (attrs.format==DRM_FORMAT_XBGR16161616F || attrs.format==DRM_FORMAT_ABGR16161616F);
+    if(!handled)return {};
+    g_vramCreateOriginal=original;
+    return vramCreateTexture(self,attrs,opaque);
+}
+bool GpuSwitch::bindClientTransferTexture(Render::GL::CGLTexture* texture,TransferTextureBind original) {
+    if(!g_state || !isProtectedInput(texture))return false;
+    g_vramBindOriginal=original;
+    vramBind(texture);
+    return true;
+}
 
 static void preconvertCommittedFrame() {
     if (!g_state) return;
@@ -593,14 +617,11 @@ static CRegion renderOffloadPass(Render::CRenderPass* pass, const CRegion& damag
     wrapOffloadSurfaces(true);
     Render::CScopeGuard restore([pass] { unwrapOffloadSurfaces(pass); });
     auto result = original(pass, damage);
-    // Optional consumers observe core elements without owning a second hook.
     unwrapOffloadSurfaces(pass);
-    for(const auto& plugin:g_pPluginSystem->getAllPlugins())
-        if(auto symbol=dlsym(plugin->m_handle,"gpu_surface_presented_v1"))
-            for(const auto& item:pass->m_passElements)
-                if(!item.discard && item.element)
-                    if(auto* surface=dynamic_cast<CSurfacePassElement*>(item.element.get()))
-                        reinterpret_cast<void (*)(void*)>(symbol)(surface);
+    for(const auto& item:pass->m_passElements)
+        if(!item.discard && item.element)
+            if(auto* surface=dynamic_cast<CSurfacePassElement*>(item.element.get()))
+                GpuSwitch::observeRenderedSurface(surface);
     return result;
 }
 static bool installPassHook() {
@@ -613,16 +634,15 @@ static bool installPassHook() {
 }
 
 
-extern "C" __attribute__((visibility("default"))) bool gpu_switch_draw_surface_v1(void* ownedElement, const CRegion* damage, bool fullscreen) {
-    if (!g_state || !g_state->enabled || !ownedElement || !damage) return false;
-    auto& original=*static_cast<UP<IPassElement>*>(ownedElement);
+bool GpuSwitch::drawTransferredSurface(UP<IPassElement>& original,const CRegion& damage,bool fullscreen) {
+    if(!g_state || !g_state->enabled)return false;
     if (!original || !dynamic_cast<CSurfacePassElement*>(original.get())) return false;
     COffloadSurfaceElement wrapper(std::move(original));
     wrapper.fullscreen=fullscreen;
     Render::CScopeGuard restore([&] { original=std::move(wrapper.original); });
     const auto previous=g_pHyprRenderer->m_renderData.damage;
     Render::CScopeGuard restoreDamage([&] {g_pHyprRenderer->m_renderData.damage=previous;});
-    g_pHyprRenderer->m_renderData.damage=*damage;
+    g_pHyprRenderer->m_renderData.damage=damage;
     wrapper.draw();
     return true;
 }
@@ -664,7 +684,11 @@ std::string GpuSwitch::clientTransferStatus() {
     const auto& nv=g_state->nv;
     Json result={{"enabled",g_state->enabled},{"ready",nv.client.ready},{"reason",nv.reason},{"worker_reason",nv.client.reason},
         {"transport",nv.client.copyOnly?"gpu-copy":"pq10-convert"},{"worker",static_cast<unsigned long>(nv.client.workerPID)},
-        {"source_gpu",nv.sourceGPU?nv.sourceGPU->id:""},{"renderer_gpu",nv.rendererGPU?nv.rendererGPU->id:""}
+        {"source_gpu",nv.sourceGPU?nv.sourceGPU->id:""},{"renderer_gpu",nv.rendererGPU?nv.rendererGPU->id:""},
+        {"eager",nv.eager},{"pipelined_requested",nv.client.pipelined},{"pipelined_active",nv.client.ready && nv.client.pipelinedActive},
+        {"prefer_local_input",nv.client.preferLocalInput},{"source_device_local",nv.client.sourceDeviceLocal},
+        {"vram_input_auto",g_state->vram.automatic},{"vram_feedback",g_state->vram.feedback},
+        {"vram_native_layout",g_state->vram.nativeLayout},{"vram_error",g_vramError}
 #if GPU_SWITCH_DIAGNOSTICS
         ,{"frames",nv.frames},{"reused",nv.reused},{"window_frames",nv.windowFrames},
         {"capture_frames",nv.captureFrames},{"eager_frames",nv.eagerFrames},

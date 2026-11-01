@@ -126,7 +126,9 @@ The plugin must still be loaded before the first rendered frame. See README.md f
 
 `client-transfer.cpp` owns render-pass wrapping, producer tracking and transfer lifecycle. `transfer/` contains the embedded Vulkan worker, synchronization protocol, transport formats and shared-output imports. No migration history or automatic-switching policy gate is required. Suspend transport before snapshotting migratable resources, then restart it after the final GL context is restored, including rollback.
 
-The optional versioned `gpu_switch_draw_surface_v1` entry point lets a specialized renderer submit a core-owned surface element through the same transport. The caller retains ownership. Its arguments and C++ object ABI are supported only with the exact compositor build checked at plugin initialization. Discover the symbol using the loaded module handle; plugins are loaded with local symbol scope. Consumers must not cache it across provider lifecycle changes.
+`rendering-optimizations.cpp` owns single-pass HDR rendering, capture pacing and VRR capability correction. It calls the transport module directly. Render-pass observation uses the transport's existing hook, avoiding duplicate hooks on the same compositor function. Texture creation and binding also share the migration module's core hooks, including device-local input protection.
+
+Before migration, stop rendering optimizations before transport; restore transport before rendering optimizations after the final GL context is selected. Per-output state holds weak monitor references. Never retain removed monitors through routing or optimization history.
 
 ```sh
 make gpu-transfer-test
@@ -139,3 +141,5 @@ Append `copy`, `copy-tiled`, `copy8`, `copy8-tiled` or `copy10-tiled` to test na
 `make check` also tests producer provenance and borrowing unique-owned queued states without converting weak pointers to shared ownership. `hyprctl gpu-switch transfers` retains operational status in release builds and adds frame counters in diagnostic builds. Detailed worker output is compiled out by default.
 
 Output routes hold weak monitor references and retire buffers for destroyed or replaced outputs. A route must not extend a monitor's lifetime after the core clears `m_output`: late `wl_output` binds can otherwise reach a live monitor with no backing output. DPMS alone does not invalidate an attached output. The route-lifetime regression test covers these cases without connecting to a compositor.
+
+The rendering-policy test checks every fullscreen safety gate and unique-owned capture-frame lifetime. `make DIAGNOSTICS=1 tools` also builds `frame-cadence-probe.so`, an opt-in event-listener probe for client commits, rendering and presentation cadence. It does not modify rendering and is not loaded automatically. Timing traces and GPU query profiling require a diagnostic build; normal builds retain operational optimization status.

@@ -3,7 +3,7 @@ name = "hyprland-gpu-switch"
 authors = ["yayuuu"]
 
 [hyprland-gpu-switch]
-description = "Automatic renderer switching and cross-GPU frame transport."
+description = "GPU renderer switching, cross-GPU transport, single-pass HDR and capture pacing."
 authors = ["yayuuu"]
 output = "hyprland-gpu-switch.so"
 build = [
