@@ -3,7 +3,7 @@ name = "hyprland-gpu-switch"
 authors = ["yayuuu"]
 
 [hyprland-gpu-switch]
-description = "Automatic compositor renderer switching between integrated and discrete GPUs."
+description = "Automatic renderer switching and cross-GPU frame transport."
 authors = ["yayuuu"]
 output = "hyprland-gpu-switch.so"
 build = [

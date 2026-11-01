@@ -1,6 +1,6 @@
 # Contributing
 
-Read [README.md](README.md) for supported versions, build dependencies and installation. Keep development focused on GPU migration and compatibility with stock Hyprland.
+Read [README.md](README.md) for supported versions, build dependencies and installation. Keep development focused on GPU migration, cross-GPU client transport and compatibility with stock Hyprland.
 
 ## Build profiles
 
@@ -32,6 +32,18 @@ hyprctl gpu-switch contexts
 ```
 
 With a diagnostic build and `HYPR_GPU_SWITCH_TEST` set in Hyprland's environment, `hyprctl gpu-switch select integrated` and `hyprctl gpu-switch select discrete` override normal target selection for testing.
+
+The `bridges` report also exposes cumulative `wait_ns`, `read_ns`, `upload_ns` and `max_copy_ns`. Take two snapshots around a workload to distinguish waiting on the compositor GPU from source readback and target upload. Upload timing measures CPU call duration, not completion of all queued GPU work. These counters are absent from normal builds.
+
+A standalone client-copy benchmark uses render-node contexts without connecting to Wayland or changing display outputs:
+
+```sh
+g++ -std=c++23 -O2 diagnostics/client-copy-bench.cpp native.cpp -lEGL -lGLESv2 -o .build/diagnostics/client-copy-bench
+.build/diagnostics/client-copy-bench /dev/dri/renderD128 /dev/dri/renderD129
+.build/diagnostics/client-copy-bench /dev/dri/renderD128 /dev/dri/renderD129 reuse
+```
+
+Append `reuse half` instead of `reuse` to benchmark RGBA16F buffers, including the native half-float readback path. Create `.build/diagnostics` first if it does not exist. Substitute the actual source and target render nodes. This benchmark isolates synchronous copying under synthetic conditions; it does not prove that a particular live client uses the fallback path.
 
 Migration traces are written to `$XDG_STATE_HOME/hyprland-gpu-switch/migration-trace.log`, falling back to `$HOME/.local/state/hyprland-gpu-switch/migration-trace.log`. Trace files use mode 0600; failures to create or write them do not interrupt migration. Normal builds do not create diagnostic files or directories.
 
@@ -109,3 +121,19 @@ Installation replaces the library atomically. It does not reload a running plugi
 The manifest runs `make clean` before `make DIAGNOSTICS=0` to rebuild against the selected Hyprland headers and avoid accepting a stale shared library after a failed build. No revision placeholders or fabricated commit hashes are used.
 
 The plugin must still be loaded before the first rendered frame. See README.md for the managed library path; starting it only through a late session reload leaves resource tracking incomplete.
+
+## Client transport
+
+`client-transfer.cpp` owns render-pass wrapping, producer tracking and transfer lifecycle. `transfer/` contains the embedded Vulkan worker, synchronization protocol, transport formats and shared-output imports. No migration history or automatic-switching policy gate is required. Suspend transport before snapshotting migratable resources, then restart it after the final GL context is restored, including rollback.
+
+The optional versioned `gpu_switch_draw_surface_v1` entry point lets a specialized renderer submit a core-owned surface element through the same transport. The caller retains ownership. Its arguments and C++ object ABI are supported only with the exact compositor build checked at plugin initialization. Discover the symbol using the loaded module handle; plugins are loaded with local symbol scope. Consumers must not cache it across provider lifecycle changes.
+
+```sh
+make gpu-transfer-test
+.build/release/cross-gpu-worker-test .build/release/gpu-transfer-worker /dev/dri/renderD128 /dev/dri/renderD129
+.build/release/cross-gpu-worker-test .build/release/gpu-transfer-worker /dev/dri/renderD129 /dev/dri/renderD128
+```
+
+Append `copy`, `copy-tiled`, `copy8`, `copy8-tiled` or `copy10-tiled` to test native-format transport. Tiled cases require a source GPU supporting the requested modifier. Tests create offscreen buffers only and verify fences, color/alpha values and GL state restoration. They do not connect to Wayland or perform renderer migration.
+
+`make check` also tests producer provenance and borrowing unique-owned queued states without converting weak pointers to shared ownership. `hyprctl gpu-switch transfers` retains operational status in release builds and adds frame counters in diagnostic builds. Detailed worker output is compiled out by default.

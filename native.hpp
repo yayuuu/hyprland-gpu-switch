@@ -39,7 +39,7 @@ struct TextureData {
     std::vector<std::byte> pixels;
 };
 TextureData readTexture(GLuint texture,GLenum target,bool contents=true);
-GLuint uploadTexture(const TextureData&);
+GLuint uploadTexture(const TextureData&, GLuint reusableTexture=0);
 void waitIdle(std::chrono::milliseconds timeout=std::chrono::milliseconds(750));
 void check(const char* operation);
 }

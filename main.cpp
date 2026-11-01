@@ -1,3 +1,4 @@
+#include "client-transfer.hpp"
 #include "probe.hpp"
 #include "migration.hpp"
 #include "drm-route.hpp"
@@ -109,6 +110,7 @@ static void cleanup() {
     if(udevSource) {wl_event_source_remove(udevSource);udevSource=nullptr;}
     if(udevMonitor) {udev_monitor_unref(udevMonitor);udevMonitor=nullptr;}
     if(udevContext) {udev_unref(udevContext);udevContext=nullptr;}
+    GpuSwitch::exitClientTransfer();
     GpuSwitch::exitMigration();
     if (timer) { timer->cancel();g_pEventLoopManager->removeTimer(timer);timer.reset(); }
     if (command) { HyprlandAPI::unregisterHyprCtlCommand(handle,command);command.reset(); }
@@ -122,6 +124,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE h) {
     try {
         roles=GpuSwitch::discoverRoles();
         GpuSwitch::initMigration(handle);
+        GpuSwitch::initClientTransfer(handle);
         udevContext=udev_new();
         if(!udevContext) throw std::runtime_error("Cannot create udev observer");
         udevMonitor=udev_monitor_new_from_netlink(udevContext,"udev");
@@ -138,6 +141,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE h) {
                 if(action=="bridges")return GpuSwitch::bridgeStatus();
                 if(action=="contexts")return GpuSwitch::transferContextStatus();
 #endif
+                if(action=="transfers")return GpuSwitch::clientTransferStatus();
                 if(action=="enable") {enabled=true;lastMigrationError.clear();}
                 else if(action=="disable") enabled=false;
                 else if(action=="retry") lastMigrationError.clear();
@@ -148,7 +152,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE h) {
                     testRole=role;lastMigrationError.clear();
                 }
 #endif
-                else if(!action.empty() && action!="status") return std::string("error: use status|enable|disable|retry");
+                else if(!action.empty() && action!="status") return std::string("error: use status|enable|disable|retry|transfers");
                 sample();return report.dump(2);
             }});
         if (!command) throw std::runtime_error("Cannot register gpu-switch status command");

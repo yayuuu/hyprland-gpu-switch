@@ -1,3 +1,4 @@
+#include "client-transfer.hpp"
 #include <bits/stdc++.h>
 #include <hyprgraphics/egl/Egl.hpp>
 #define private public
@@ -94,6 +95,7 @@ struct OriginTexture {
 struct ClientBridge {WP<ITexture> texture;std::shared_ptr<OriginTexture> source;bool dirty=true;bool eventDriven=false;};
 #if GPU_SWITCH_DIAGNOSTICS
 static uint64_t bridgeCopies=0,bridgeSkips=0,bridgeBytes=0;
+static uint64_t bridgeWaitNs=0,bridgeReadNs=0,bridgeUploadNs=0,bridgeMaxCopyNs=0;
 #endif
 static CFunctionHook* surfaceCommitHook=nullptr;
 static std::map<ITexture*,ClientBridge> clientBridges;
@@ -245,7 +247,7 @@ std::string GpuSwitch::bridgeStatus() {
     Json rows=Json::array();
     for(const auto& [texture,bridge]:clientBridges)if(bridge.texture)
         rows.push_back({{"width",static_cast<unsigned long>(texture->m_size.x)},{"height",static_cast<unsigned long>(texture->m_size.y)},{"event_driven",bridge.eventDriven},{"dirty",bridge.dirty}});
-    return Json({{"copies",bridgeCopies},{"skipped",bridgeSkips},{"bytes",bridgeBytes},{"bridges",rows}}).dump();
+    return Json({{"copies",bridgeCopies},{"skipped",bridgeSkips},{"bytes",bridgeBytes},{"wait_ns",bridgeWaitNs},{"read_ns",bridgeReadNs},{"upload_ns",bridgeUploadNs},{"max_copy_ns",bridgeMaxCopyNs},{"bridges",rows}}).dump();
 }
 #endif
 static void bindTexture(CGLTexture* self) {
@@ -262,10 +264,24 @@ static void bindTexture(CGLTexture* self) {
         try {
             // The compositor has queued the client's acquire fence on the active
             // GPU. Finish that bounded wait before reading on the old GPU.
+#if GPU_SWITCH_DIAGNOSTICS
+            const auto copyStart=std::chrono::steady_clock::now();
+#endif
             Native::waitIdle();
+#if GPU_SWITCH_DIAGNOSTICS
+            const auto waitEnd=std::chrono::steady_clock::now();
+#endif
             auto pixels=it->second.source->read(true);
-            auto fresh=Native::uploadTexture(pixels);
-            glDeleteTextures(1,&self->m_texID);self->m_texID=fresh;
+#if GPU_SWITCH_DIAGNOSTICS
+            const auto readEnd=std::chrono::steady_clock::now();
+#endif
+            Native::uploadTexture(pixels,self->m_texID);
+#if GPU_SWITCH_DIAGNOSTICS
+            const auto uploadEnd=std::chrono::steady_clock::now();
+            const auto ns=[](auto from,auto to)->uint64_t{return std::chrono::duration_cast<std::chrono::nanoseconds>(to-from).count();};
+            bridgeWaitNs+=ns(copyStart,waitEnd);bridgeReadNs+=ns(waitEnd,readEnd);bridgeUploadNs+=ns(readEnd,uploadEnd);
+            bridgeMaxCopyNs=std::max(bridgeMaxCopyNs,ns(copyStart,uploadEnd));
+#endif
             self->m_cachedStates.fill(std::nullopt);
             it->second.dirty=false;
 #if GPU_SWITCH_DIAGNOSTICS
@@ -486,6 +502,14 @@ std::string GpuSwitch::migrate(const std::string& id,const std::function<bool()>
     }
     Diagnostics::trace("frames-drained");
     struct Unpause {~Unpause(){GpuSwitch::cancelMigration();}} unpause;
+    // Drain worker submissions and destroy raw EGL imports in the OLD context.
+    // Resume only after all migration guards have restored the final context.
+    struct TransferReset {
+        HANDLE handle;
+        explicit TransferReset(HANDLE h):handle(h){GpuSwitch::exitClientTransfer();}
+        ~TransferReset(){try{GpuSwitch::initClientTransfer(handle);}catch(const std::exception& e){
+            GpuSwitch::exitClientTransfer();Log::logger->log(Log::ERR,"[gpu-switch] Cannot restore client transport: {}",e.what());}}
+    } transferReset(pluginHandle);
     // Release extension-owned rendering resources through the compositor lifecycle.
     struct PluginReset {
         struct Entry {std::string path;bool configured=false;};

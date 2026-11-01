@@ -138,12 +138,27 @@ TextureData readTexture(GLuint texture,GLenum target,bool contents) {
         result.format=GL_RGBA;result.type=GL_UNSIGNED_BYTE;
     } else throw std::runtime_error(std::format("Texture internal format 0x{:x} cannot be migrated yet",result.internal));
     if(!contents) {result.discard=true;return result;}
+    // Preserve half-float storage rather than expanding every channel to float32.
+    // Use only the readback pair explicitly advertised for this framebuffer.
+    glGenFramebuffers(1,&restore.temp);glBindFramebuffer(GL_READ_FRAMEBUFFER,restore.temp);
+    if(target==GL_TEXTURE_2D)glFramebufferTexture2D(GL_READ_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,target,texture,0);
+    else glFramebufferTextureLayer(GL_READ_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,texture,0,0);
+    if(glCheckFramebufferStatus(GL_READ_FRAMEBUFFER)!=GL_FRAMEBUFFER_COMPLETE)throw std::runtime_error("Texture cannot be read back for migration");
+    glReadBuffer(GL_COLOR_ATTACHMENT0);
+    if(result.internal==GL_RGBA16F || result.internal==GL_RGB16F || result.internal==GL_R16F) {
+        GLint readFormat=0,readType=0;
+        glGetIntegerv(GL_IMPLEMENTATION_COLOR_READ_FORMAT,&readFormat);
+        glGetIntegerv(GL_IMPLEMENTATION_COLOR_READ_TYPE,&readType);
+        check("query native framebuffer readback format");
+        if(readFormat==GL_RGBA && readType==GL_HALF_FLOAT) {
+            result.type=GL_HALF_FLOAT;bytesPerPixel=8;
+        }
+    }
     size_t size=static_cast<size_t>(result.width)*result.height*result.depth*bytesPerPixel;
     if (size>512ULL*1024*1024) throw std::runtime_error("Texture migration exceeds 512 MiB limit");
     result.pixels.resize(size);
     glBindBuffer(GL_PIXEL_PACK_BUFFER,0);glPixelStorei(GL_PACK_ALIGNMENT,1);glPixelStorei(GL_PACK_ROW_LENGTH,0);
     glPixelStorei(GL_PACK_SKIP_PIXELS,0);glPixelStorei(GL_PACK_SKIP_ROWS,0);
-    glGenFramebuffers(1,&restore.temp);glBindFramebuffer(GL_READ_FRAMEBUFFER,restore.temp);
     for (int layer=0;layer<result.depth;++layer) {
         if (target==GL_TEXTURE_2D) glFramebufferTexture2D(GL_READ_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,target,texture,0);
         else glFramebufferTextureLayer(GL_READ_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,texture,0,layer);
@@ -154,7 +169,7 @@ TextureData readTexture(GLuint texture,GLenum target,bool contents) {
     }
     return result;
 }
-GLuint uploadTexture(const TextureData& data) {
+GLuint uploadTexture(const TextureData& data, GLuint reusableTexture) {
     GLint pbo=0,alignment=0,row=0,skipPixels=0,skipRows=0,imageHeight=0,skipImages=0,binding=0;
     glGetIntegerv(GL_PIXEL_UNPACK_BUFFER_BINDING,&pbo);glGetIntegerv(GL_UNPACK_ALIGNMENT,&alignment);
     glGetIntegerv(GL_UNPACK_ROW_LENGTH,&row);glGetIntegerv(GL_UNPACK_SKIP_PIXELS,&skipPixels);glGetIntegerv(GL_UNPACK_SKIP_ROWS,&skipRows);
@@ -168,17 +183,33 @@ GLuint uploadTexture(const TextureData& data) {
             glPixelStorei(GL_UNPACK_IMAGE_HEIGHT,imageHeight);glPixelStorei(GL_UNPACK_SKIP_IMAGES,skipImages);glBindTexture(target,binding);
         }
     } restore{data.target,pbo,alignment,row,skipPixels,skipRows,imageHeight,skipImages,binding};
-    GLuint texture=0;glGenTextures(1,&texture);
+    GLuint texture=reusableTexture;
+    if(!texture)glGenTextures(1,&texture);
     try {
         glBindTexture(data.target,texture);glBindBuffer(GL_PIXEL_UNPACK_BUFFER,0);
         glPixelStorei(GL_UNPACK_ALIGNMENT,1);glPixelStorei(GL_UNPACK_ROW_LENGTH,0);glPixelStorei(GL_UNPACK_SKIP_PIXELS,0);glPixelStorei(GL_UNPACK_SKIP_ROWS,0);
         glPixelStorei(GL_UNPACK_IMAGE_HEIGHT,0);glPixelStorei(GL_UNPACK_SKIP_IMAGES,0);
         if (data.width && data.height) {
-            if (data.target==GL_TEXTURE_2D) glTexImage2D(data.target,0,data.internal,data.width,data.height,0,data.format,data.type,data.discard?nullptr:data.pixels.data());
-            else glTexImage3D(data.target,0,data.internal,data.width,data.height,data.depth,0,data.format,data.type,data.discard?nullptr:data.pixels.data());
+            GLint width=0,height=0,depth=1,internal=0;
+            if(reusableTexture) {
+                glGetTexLevelParameteriv(data.target,0,GL_TEXTURE_WIDTH,&width);
+                glGetTexLevelParameteriv(data.target,0,GL_TEXTURE_HEIGHT,&height);
+                glGetTexLevelParameteriv(data.target,0,GL_TEXTURE_INTERNAL_FORMAT,&internal);
+                if(data.target==GL_TEXTURE_3D)glGetTexLevelParameteriv(data.target,0,GL_TEXTURE_DEPTH,&depth);
+            }
+            const bool reuse=reusableTexture && width==data.width && height==data.height && depth==data.depth && internal==static_cast<GLint>(data.internal);
+            if(reuse) {
+                if(!data.discard) {
+                    if(data.target==GL_TEXTURE_2D)glTexSubImage2D(data.target,0,0,0,data.width,data.height,data.format,data.type,data.pixels.data());
+                    else glTexSubImage3D(data.target,0,0,0,0,data.width,data.height,data.depth,data.format,data.type,data.pixels.data());
+                }
+            } else {
+                if(data.target==GL_TEXTURE_2D)glTexImage2D(data.target,0,data.internal,data.width,data.height,0,data.format,data.type,data.discard?nullptr:data.pixels.data());
+                else glTexImage3D(data.target,0,data.internal,data.width,data.height,data.depth,0,data.format,data.type,data.discard?nullptr:data.pixels.data());
+            }
         }
         for (size_t i=0;i<parameters.size();++i) {if(i==8 && data.target!=GL_TEXTURE_3D)continue;glTexParameteri(data.target,parameters[i],data.params[i]);}
         check("upload migrated texture");return texture;
-    } catch (...) {glDeleteTextures(1,&texture);throw;}
+    } catch (...) {if(!reusableTexture)glDeleteTextures(1,&texture);throw;}
 }
 }

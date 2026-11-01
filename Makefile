@@ -21,11 +21,11 @@ PACKAGES = hyprland aquamarine hyprutils pixman-1 libdrm pangocairo libinput lib
 PACKAGE_CFLAGS = $(shell $(PKG_CONFIG) --cflags $(PACKAGES))
 PACKAGE_LIBS = $(shell $(PKG_CONFIG) --libs $(PACKAGES))
 COMPILE_FLAGS = $(CPPFLAGS) -DGPU_SWITCH_DIAGNOSTICS=$(DIAGNOSTICS) $(CXXFLAGS) $(STANDARD_FLAGS)
-SOURCES = main.cpp probe.cpp migration.cpp drm-route.cpp aq-transfer.cpp native.cpp
+SOURCES = client-transfer.cpp transfer/embedded.cpp transfer/worker-blob.S main.cpp probe.cpp migration.cpp drm-route.cpp aq-transfer.cpp native.cpp
 ifeq ($(DIAGNOSTICS),1)
 SOURCES += diagnostics/diagnostics.cpp
 endif
-HEADERS = $(wildcard *.hpp vendor/aquamarine/*.hpp) diagnostics/diagnostics.hpp
+HEADERS = $(wildcard *.hpp vendor/aquamarine/*.hpp transfer/*.hpp) diagnostics/diagnostics.hpp
 
 .DEFAULT_GOAL := all
 .PHONY: all check check-deps tools require-diagnostics install uninstall clean FORCE
@@ -37,8 +37,8 @@ check-deps:
 $(BUILD_DIR):
 	mkdir -p $@
 
-$(BUILD_DIR)/hyprland-gpu-switch.so: $(SOURCES) $(HEADERS) Makefile | check-deps $(BUILD_DIR)
-	$(CXX) $(COMPILE_FLAGS) -shared -fPIC -fno-gnu-unique $(PACKAGE_CFLAGS) $(SOURCES) $(LDFLAGS) $(PACKAGE_LIBS) -o $@.new
+$(BUILD_DIR)/hyprland-gpu-switch.so: $(SOURCES) $(HEADERS) Makefile $(BUILD_DIR)/gpu-transfer-worker | check-deps $(BUILD_DIR)
+	$(CXX) $(COMPILE_FLAGS) -DGPU_TRANSFER_WORKER_PATH='"$(BUILD_DIR)/gpu-transfer-worker"' -DGPU_TRANSFER_AQ_VERSION='"$(shell $(PKG_CONFIG) --modversion aquamarine)"' -shared -fPIC -fno-gnu-unique $(PACKAGE_CFLAGS) $(SOURCES) $(LDFLAGS) $(PACKAGE_LIBS) -o $@.new
 	mv $@.new $@
 
 # Always select the requested profile, even when switching back to an older build.
@@ -105,3 +105,31 @@ $(BUILD_DIR)/transfer-test: tests/transfer-test.cpp aq-transfer.cpp diagnostics/
 clean:
 	rm -rf .build
 	rm -f hyprland-gpu-switch.so hyprland-gpu-switch.so.new gpu-switch-probe hook-probe.so transfer-opt.so transfer-opt.so.new policy-test buffer-compat-test route-plan-test native-test transfer-test
+
+.build/transfer:
+	mkdir -p $@
+
+.build/transfer/pq.comp.spv: transfer/pq.comp | .build/transfer
+	glslangValidator -V $< -o $@
+
+$(BUILD_DIR)/gpu-transfer-worker: transfer/worker.cpp transfer/protocol.hpp transfer/formats.hpp transfer/supervisor.hpp transfer/shader-blob.S .build/transfer/pq.comp.spv Makefile | $(BUILD_DIR)
+	$(CXX) -DGPU_SWITCH_DIAGNOSTICS=$(DIAGNOSTICS) -O2 -std=c++23 -Wall -Wextra -Werror -Wno-missing-field-initializers transfer/worker.cpp transfer/shader-blob.S -lvulkan -o $@.new
+	strip --strip-debug $@.new
+	mv $@.new $@
+
+$(BUILD_DIR)/gpu-route-test: tests/gpu-route-test.cpp transfer/gpu_route.hpp | $(BUILD_DIR)
+	$(CXX) $(COMPILE_FLAGS) $< -o $@
+
+$(BUILD_DIR)/queued-state-test: tests/queued-state-test.cpp transfer/queued_state.hpp | $(BUILD_DIR)
+	$(CXX) $(COMPILE_FLAGS) $< -lhyprutils -o $@
+
+$(BUILD_DIR)/cross-gpu-worker-test: tests/cross-gpu-worker-test.cpp $(wildcard transfer/*.hpp) | $(BUILD_DIR)
+	$(CXX) $(COMPILE_FLAGS) $< -lvulkan -lEGL -lGLESv2 -o $@
+
+.PHONY: gpu-transfer-test transport-check
+transport-check: $(BUILD_DIR)/gpu-route-test $(BUILD_DIR)/queued-state-test
+	./$(BUILD_DIR)/gpu-route-test
+	./$(BUILD_DIR)/queued-state-test
+
+gpu-transfer-test: $(BUILD_DIR)/cross-gpu-worker-test $(BUILD_DIR)/gpu-transfer-worker
+check: transport-check

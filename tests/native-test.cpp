@@ -18,6 +18,17 @@ int main(int argc,char** argv) {
         GLuint migrated=uploadTexture(snapshot);waitIdle();
         auto result=readTexture(migrated,GL_TEXTURE_2D);
         if (result.pixels!=snapshot.pixels) throw std::runtime_error("Migrated texture contents differ");
+        auto changed=snapshot;
+        for(auto& pixel:changed.pixels)pixel^=std::byte{0x5a};
+        if(uploadTexture(changed,migrated)!=migrated)throw std::runtime_error("Reusable upload changed texture identity");
+        waitIdle();
+        if(readTexture(migrated,GL_TEXTURE_2D).pixels!=changed.pixels)throw std::runtime_error("Reusable upload retained stale pixels");
+        auto resized=changed;resized.width=8;resized.height=8;resized.pixels.resize(8*8*4);
+        uploadTexture(resized,migrated);waitIdle();
+        auto resizedResult=readTexture(migrated,GL_TEXTURE_2D);
+        if(resizedResult.width!=8 || resizedResult.height!=8 || resizedResult.pixels!=resized.pixels)throw std::runtime_error("Reusable upload failed to resize storage");
+        uploadTexture(snapshot,migrated);waitIdle();
+        std::cout<<"PASS: reusable texture upload, pixel refresh and storage resize\n";
         auto returnData=readTexture(migrated,GL_TEXTURE_2D);source.current();
         auto returned=uploadTexture(returnData);waitIdle();
         if (readTexture(returned,GL_TEXTURE_2D).pixels!=data.pixels) throw std::runtime_error("Return migration differs");
@@ -28,6 +39,9 @@ int main(int argc,char** argv) {
         std::vector<float> values(4*4*4*4);for(size_t i=0;i<values.size();++i)values[i]=static_cast<float>(i%32)/32;
         lut.pixels.resize(values.size()*sizeof(float));std::memcpy(lut.pixels.data(),values.data(),lut.pixels.size());
         GLuint sourceLut=uploadTexture(lut);waitIdle();auto lutPixels=readTexture(sourceLut,GL_TEXTURE_3D);
+        if(lutPixels.type!=GL_HALF_FLOAT && lutPixels.type!=GL_FLOAT)throw std::runtime_error("Float16 LUT readback lost floating-point precision");
+        const size_t lutPixelBytes=lutPixels.type==GL_HALF_FLOAT?8:16;
+        if(lutPixels.pixels.size()!=4*4*4*lutPixelBytes)throw std::runtime_error("Incorrect float16 LUT staging size");
         target.current();GLuint targetLut=uploadTexture(lutPixels);waitIdle();
         if(readTexture(targetLut,GL_TEXTURE_3D).pixels!=lutPixels.pixels)throw std::runtime_error("3D LUT differs after migration");
         glDeleteTextures(1,&targetLut);source.current();glDeleteTextures(1,&sourceLut);

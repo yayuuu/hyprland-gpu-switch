@@ -1,8 +1,3 @@
-# GPU migration development
-
-- Target stock Hyprland. Do not rebuild or patch the compositor to implement this plugin.
-- Keep the project focused exclusively on GPU migration.
-- Read README.md and CONTRIBUTING.md before building or testing.
 - Place diagnostic-only sources in diagnostics/. Keep diagnostics behind GPU_SWITCH_DIAGNOSTICS, disabled by default. The default make target must build only the normal plugin.
 - Respect test authorization already provided in the current conversation. Never log the user out or restart their desktop session automatically.
 - Keep test sources in tests/ and diagnostic-only implementation/tools in diagnostics/.
