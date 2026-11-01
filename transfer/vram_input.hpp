@@ -90,30 +90,30 @@ static void vramBind(Render::GL::CGLTexture* texture) {
     const auto owner = currentNV().owner.lock();
     const auto surface = currentNV().sourceSurface.lock();
     const auto monitor = owner ? owner->m_monitor.lock() : nullptr;
-    if (owner && owner->m_isMapped && surface && surface->m_current.buffer && monitor &&
+    if (owner && owner->mapped() && surface && surface->m_current.buffer && monitor &&
         g_state->enabled && currentNV().enabled) {
         CSurfacePassElement::SRenderData data{};
         data.surface = surface; data.texture = surface->m_current.texture; data.pWindow = owner;
         CSurfacePassElement element{data};
-        if (auto ready = prepareOffloadTexture(element, monitor, false)) {
+        if (auto ready = prepareOffloadTexture(transferContext(), element, monitor, false)) {
             proxy.slot = ready->slot;
         }
     }
     auto safe = currentNV().cachedSlot?currentNV().slots[*currentNV().cachedSlot].texture:SP<Render::ITexture>{};
     if (safe && safe->ok()) {
-        auto& rd = g_pHyprRenderer->m_renderData;
+        auto& rd = transferContext().m_data;
         if (surface && monitor && rd.currentFB && surface->m_colorManagement.valid()) {
             const auto source = NColorManagement::CImageDescription::from(surface->m_colorManagement->imageDescription());
             const auto target = rd.currentFB->imageDescription();
             if (target && source) {
-                proxy.savedCMCache = g_pHyprRenderer->m_cmSettingsCache;
-                const auto originalSettings = g_pHyprRenderer->getCMSettings(source, target, surface, true, monitor->m_sdrMinLuminance, monitor->m_sdrMaxLuminance, true);
-                auto packedSettings = g_pHyprRenderer->getCMSettings(safe->m_imageDescription, target, surface, true, monitor->m_sdrMinLuminance, monitor->m_sdrMaxLuminance, true);
+                proxy.savedCMCache = transferContext().m_cmSettingsCache;
+                const auto originalSettings = g_pHyprRenderer->getCMSettings(transferContext(), source, target, surface, true, monitor->m_sdrMinLuminance, monitor->m_sdrMaxLuminance, true);
+                auto packedSettings = g_pHyprRenderer->getCMSettings(transferContext(), safe->m_imageDescription, target, surface, true, monitor->m_sdrMinLuminance, monitor->m_sdrMaxLuminance, true);
                 packedSettings.needsTonemap = originalSettings.needsTonemap;
                 packedSettings.tonemapMode = originalSettings.tonemapMode;
                 packedSettings.maxLuminance = originalSettings.maxLuminance;
                 packedSettings.dstMaxLuminance = originalSettings.dstMaxLuminance;
-                for (auto& entry : g_pHyprRenderer->m_cmSettingsCache)
+                for (auto& entry : transferContext().m_cmSettingsCache)
                     if (entry.srcDescId == safe->m_imageDescription->id() && entry.dstDescId == target->id()) entry.settings = packedSettings;
             }
         }
@@ -144,7 +144,7 @@ static void vramUnbind(Render::GL::CGLTexture* texture) {
         if (fence && fence->isValid()) currentNV().slots[*proxy.slot].readComplete.reset(fence->takeFd().take());
         else { glFinish(); requestOffloadStop(); }
     }
-    if (proxy.savedCMCache) { g_pHyprRenderer->m_cmSettingsCache = std::move(*proxy.savedCMCache); proxy.savedCMCache.reset(); }
+    if (proxy.savedCMCache) { transferContext().m_cmSettingsCache = std::move(*proxy.savedCMCache); proxy.savedCMCache.reset(); }
     texture->m_imageDescription = proxy.savedDescription;
     proxy.savedDescription.reset(); proxy.bound = false; proxy.slot.reset();
 }
@@ -179,7 +179,7 @@ static void removeVramHook(CFunctionHook*& hook) {
 static bool installVramHook(CFunctionHook*& hook, const std::string& name, const std::string& signature, void* replacement, bool prefix = false) {
     if (hook) return true;
     std::set<void*> addresses;
-    for (const auto& match : HyprlandAPI::findFunctionsByName(g_handle, name))
+    for (const auto& match : GpuSwitch::findHookFunctions(g_handle, name))
         if (prefix ? match.demangled.starts_with(signature) : match.demangled == signature) addresses.insert(match.address);
     // The API caches parallel nm/demangler output. Resolve these exact ABI
     // symbols directly when that cached listing lacks a texture method.
@@ -188,9 +188,9 @@ static bool installVramHook(CFunctionHook*& hook, const std::string& name, const
                              signature == "Render::GL::CGLTexture::unbind()" ? "_ZN6Render2GL10CGLTexture6unbindEv" : nullptr;
         if (symbol) if (auto* address = dlsym(RTLD_DEFAULT, symbol)) addresses.insert(address);
     }
-    if (addresses.size() != 1) { g_vramError = "hook " + name + " has " + std::to_string(addresses.size()) + " addresses"; Log::logger->log(Log::ERR, "[gpu-transfer-vram] hook {}: {} addresses", name, addresses.size()); return false; }
+    if (addresses.size() != 1) { g_vramError = "hook " + name + " has " + std::to_string(addresses.size()) + " addresses"; LOG(Log::ERR, "[gpu-transfer-vram] hook {}: {} addresses", name, addresses.size()); return false; }
     hook = HyprlandAPI::createFunctionHook(g_handle, *addresses.begin(), replacement);
-    if (!hook || !hook->hook()) { g_vramError = "cannot hook " + name; Log::logger->log(Log::ERR, "[gpu-transfer-vram] hook failed: {}", name); removeVramHook(hook); return false; }
+    if (!hook || !hook->hook()) { g_vramError = "cannot hook " + name; LOG(Log::ERR, "[gpu-transfer-vram] hook failed: {}", name); removeVramHook(hook); return false; }
     return true;
 }
 

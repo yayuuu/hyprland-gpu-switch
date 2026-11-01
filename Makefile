@@ -32,7 +32,7 @@ HEADERS = $(wildcard *.hpp vendor/aquamarine/*.hpp transfer/*.hpp) diagnostics/d
 all: hyprland-gpu-switch.so
 
 check-deps:
-	@$(PKG_CONFIG) --print-errors --exists $(PACKAGES) 'hyprland = 0.56.2' 'aquamarine = 0.15.1'
+	@$(PKG_CONFIG) --print-errors --exists $(PACKAGES) 'hyprland = 0.57.0' 'aquamarine = 0.15.1'
 
 $(BUILD_DIR):
 	mkdir -p $@

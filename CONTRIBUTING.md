@@ -98,7 +98,7 @@ Synchronization device handles and DMA-BUF feedback follow the selected renderer
 
 The plugin uses Hyprland and Aquamarine internals. The running Hyprland hash must match the development headers. Aquamarine internal declarations are pinned to 0.15.1, commit `f31c47a1b9d300847d8fc3108ad959448103dfc1`; preserve their upstream license in `vendor/aquamarine/LICENSE`.
 
-Function lookup must demangle the exact symbol signature associated with its address, rather than trusting separately cached name lists. Preserve this check when adding hooks.
+Function lookup uses `function-hooks.hpp` to demangle the exact symbol signature associated with its address, rather than trusting separately cached name lists. Preserve this check when adding hooks. Render-pass hooks and elements must forward the supplied `CRenderContext`, including for isolated capture; texture bind hooks borrow that context only during synchronous pass execution.
 
 The module uses `RTLD_NODELETE` because live buffers can retain C++ callbacks. Replacing a file at the same path does not replace code already mapped in a running process. The plugin refuses unloading after migration; use disable to pause policy decisions, and start a new session to test a replacement build with complete tracking.
 
@@ -116,7 +116,7 @@ Installation replaces the library atomically. It does not reload a running plugi
 
 ## hyprpm manifest
 
-`hyprpm.toml` intentionally omits `commit_pins`. hyprpm therefore follows the latest revision of the repository's default branch. Compatibility remains enforced by the build's dependency version checks and the plugin's Hyprland hash checks.
+`hyprpm.toml` pins Hyprland 0.56.2 (`efb50993780079460b0cbed1363e2166a2de1d9f`) to the last compatible plugin commit, `c088b367fe4180f4812fe8a0e23fced8913ccf96`. Hyprland 0.57.0 follows the latest revision of the repository's default branch. Compatibility remains enforced by the build's dependency version checks and the plugin's Hyprland hash checks.
 
 The manifest runs `make clean` before `make DIAGNOSTICS=0` to rebuild against the selected Hyprland headers and avoid accepting a stale shared library after a failed build. No revision placeholders or fabricated commit hashes are used.
 

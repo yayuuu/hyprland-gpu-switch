@@ -53,7 +53,7 @@ VRR capability handling validates the connector's actual DRM properties and corr
 
 ## Requirements
 
-This version targets **Hyprland 0.56.2** (`efb50993780079460b0cbed1363e2166a2de1d9f`) and **Aquamarine 0.15.1**. Development headers must match the installed compositor and libraries. Other versions require compatibility work.
+This version targets **Hyprland 0.57.0** (`0aa6745f705f2c4b0a5004eb019ef76e5bbdb426`) and **Aquamarine 0.15.1**. Development headers must match the installed compositor and libraries. Other versions require compatibility work.
 
 Build tools: **GCC/G++ 14 or another compatible C++23 toolchain**, GNU Make, `pkg-config`, `glslangValidator` (`glslang-tools`) and binutils. GCC 14.2 is the tested compiler.
 
@@ -108,9 +108,9 @@ hyprpm add https://github.com/yayuuu/hyprland-gpu-switch.git
 hyprpm enable hyprland-gpu-switch
 ```
 
-The manifest has no commit pins: hyprpm builds the latest revision of the default branch. The same compiler, dependencies and version checks still apply.
+The manifest pins Hyprland 0.56.2 to plugin commit `c088b367fe4180f4812fe8a0e23fced8913ccf96`. Hyprland 0.57.0 follows the latest revision of the default branch. The same compiler, dependencies and version checks still apply.
 
-This plugin needs to load before rendering starts. Enabling it in an existing session is not enough: configure early loading of the installed library and start a new login session. For Hyprland 0.56.2, the hyprpm-managed library can be loaded with:
+This plugin needs to load before rendering starts. Enabling it in an existing session is not enough: configure early loading of the installed library and start a new login session. For Hyprland 0.57.0, the hyprpm-managed library can be loaded with:
 
 ```lua
 hl.plugin.load("/var/cache/hyprpm/" .. os.getenv("USER") .. "/hyprland-gpu-switch/hyprland-gpu-switch.so")
@@ -144,6 +144,8 @@ Automatic switching starts when the plugin loads. No separate enable command is 
 | `hyprctl gpu-switch rendering capture-pacing-on` | Restore capture pacing (default) |
 | `hyprctl gpu-switch transfers` | Show per-surface workers, readiness, mode and GPU routes |
 | `hyprctl gpu-switch retry` | Clear a migration error and allow another attempt |
+
+Rendering controls are also available in Lua, for example `hl.plugin.gpu_switch.rendering("off")` or `hl.plugin.gpu_switch.rendering("status")`.
 
 Disabling switching leaves the current renderer in place. Cross-GPU client transport remains active independently. After a migration, the plugin keeps live GPU resources and cannot be unloaded safely within that session.
 

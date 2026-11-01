@@ -20,14 +20,16 @@
 #undef private
 
 #include <hyprland/src/Compositor.hpp>
+#include <hyprland/src/desktop/view/window/WindowPresentation.hpp>
 #include <hyprland/src/config/ConfigValue.hpp>
-#include <hyprland/src/debug/HyprCtl.hpp>
+#include <hyprland/src/ipc/s1/S1.hpp>
 #include <hyprland/src/debug/log/Logger.hpp>
 #include <hyprland/src/desktop/view/WLSurface.hpp>
 #include <hyprland/src/event/EventBus.hpp>
 #include <hyprland/src/output/Monitor.hpp>
 #include <hyprland/src/pointer/PointerManager.hpp>
 #include <hyprland/src/plugins/PluginAPI.hpp>
+#include "function-hooks.hpp"
 #include "rendering-optimizations.hpp"
 #include "client-transfer.hpp"
 #include "version.hpp"
@@ -46,12 +48,13 @@
 #include <linux/dma-buf.h>
 #include <xf86drm.h>
 #include <xf86drmMode.h>
+#include <lua.hpp>
 
 #include "singlepass-policy.hpp"
 #include "capture-wait.hpp"
 #include "transfer/pq.hpp"
 
-static_assert(std::string_view{GIT_COMMIT_HASH} == "efb50993780079460b0cbed1363e2166a2de1d9f", "Build against Hyprland v0.56.2 headers");
+static_assert(std::string_view{GIT_COMMIT_HASH} == "0aa6745f705f2c4b0a5004eb019ef76e5bbdb426", "Build against Hyprland v0.57.0 headers");
 static_assert(std::string_view{GPU_TRANSFER_AQ_VERSION}.substr(0, 4) == "0.15", "Build against Aquamarine 0.15.x headers");
 
 static HANDLE g_handle = nullptr;
@@ -184,7 +187,7 @@ struct SRenderingState {
     std::string shaderMode = "stock";
     std::string shaderError;
     GLuint pqTexture = 0;
-    std::map<std::pair<std::string, Render::ShaderFeatureFlags>, SP<CShader>> fastShaders;
+    std::map<std::pair<std::string, Render::SShaderVariant>, SP<CShader>> fastShaders;
     uint64_t shaderFrames = 0;
     struct SProfileQuery { GLuint read = 0, convert = 0; };
     std::vector<SProfileQuery> pendingQueries;
@@ -214,8 +217,8 @@ static void traceEvent(const char* event, PHLMONITOR monitor = nullptr, std::opt
     const auto elapsed = std::chrono::duration<double, std::milli>(timestamp.value_or(std::chrono::steady_clock::now()) - g_state->traceStart).count();
     const auto pointer = Pointer::mgr()->position();
     CBox damage;
-    if (monitor && g_pHyprRenderer->m_renderMode == Render::RENDER_MODE_NORMAL)
-        damage = g_pHyprRenderer->m_renderData.damage.getExtents();
+    if (monitor && g_pHyprRenderer->context().m_mode == Render::RENDER_MODE_NORMAL)
+        damage = g_pHyprRenderer->context().m_data.damage.getExtents();
     g_state->traceRows.push_back(std::format("[\"{}\",{:.4f},{},{},{},{:.1f},{:.1f},{:.0f},{:.0f},{:.0f},{:.0f},{},{}]",
         event, elapsed, 0, 0, g_state->cursorGeneration,
         pointer.x, pointer.y, damage.x, damage.y, damage.w, damage.h,
@@ -309,22 +312,22 @@ static void replacePQ(std::string& source) {
 // Called only inside an active GL render pass. Temporarily replace two shader
 // cache entries only around this opaque scRGB -> PQ surface draw. Core shaders
 // are restored before drawing the linear cursor patch or any other output.
-static bool drawTransferredSurface(UP<IPassElement>& element,const CRegion& damage) {
-    return GpuSwitch::drawTransferredSurface(element,damage,true);
+static bool drawTransferredSurface(Render::CRenderContext& ctx, UP<IPassElement>& element,const CRegion& damage) {
+    return GpuSwitch::drawTransferredSurface(ctx, element,damage,true);
 }
-static void drawPrimary(const CRegion& damage) {
+static void drawPrimary(Render::CRenderContext& ctx, const CRegion& damage) {
     auto& saved = g_state->restore;
     auto& gl = *Render::GL::g_pHyprOpenGL;
-    auto draw = [&] { g_pHyprRenderer->draw(saved.originalPass.at(saved.surfaceIndex).element, damage); };
-    if (g_state->shaderMode == "stock" && drawTransferredSurface(saved.originalPass.at(saved.surfaceIndex).element,damage))return;
+    auto draw = [&] { g_pHyprRenderer->draw(ctx, saved.originalPass.at(saved.surfaceIndex).element, damage); };
+    if (g_state->shaderMode == "stock" && drawTransferredSurface(ctx, saved.originalPass.at(saved.surfaceIndex).element,damage))return;
     if (g_state->shaderMode == "nearest" || g_state->shaderMode == "fetch") {
         const auto& surface = saved.surface->m_data.surface->m_current;
         const auto box = saved.surface->getTexBox();
-        if (saved.surface->m_data.texture->m_size != g_pHyprRenderer->m_renderData.pMonitor->m_pixelSize ||
+        if (saved.surface->m_data.texture->m_size != ctx.m_data.pMonitor->m_pixelSize ||
             surface.scale != 1 || surface.viewport.hasSource ||
-            (surface.viewport.hasDestination && surface.viewport.destination != g_pHyprRenderer->m_renderData.pMonitor->m_pixelSize) ||
+            (surface.viewport.hasDestination && surface.viewport.destination != ctx.m_data.pMonitor->m_pixelSize) ||
             surface.transform != WL_OUTPUT_TRANSFORM_NORMAL || box.pos() != Vector2D{} ||
-            box.size() != g_pHyprRenderer->m_renderData.pMonitor->m_pixelSize) {
+            box.size() != ctx.m_data.pMonitor->m_pixelSize) {
             g_state->shaderError = "Sampling optimization requires exact 1:1 mapping";
             draw();
             return;
@@ -339,7 +342,7 @@ static void drawPrimary(const CRegion& damage) {
         }
     }
     if (g_state->shaderMode == "stock" || g_state->shaderMode == "profile" || !g_state->shaderError.empty() ||
-        g_pHyprRenderer->m_renderData.pMonitor->m_imageDescription->value().transferFunction != NColorManagement::CM_TRANSFER_FUNCTION_ST2084_PQ) {
+        ctx.m_data.pMonitor->m_imageDescription->value().transferFunction != NColorManagement::CM_TRANSFER_FUNCTION_ST2084_PQ) {
         draw();
         return;
     }
@@ -351,7 +354,7 @@ static void drawPrimary(const CRegion& damage) {
     glGetIntegeri_v(GL_SAMPLER_BINDING, 7, &previousSampler);
     glBindSampler(7, 0);
     auto& variants = gl.m_shaders->fragVariants[Render::SH_FRAG_SURFACE];
-    std::map<Render::ShaderFeatureFlags, std::optional<SP<CShader>>> originals;
+    std::map<Render::SShaderVariant, std::optional<SP<CShader>>> originals;
     bool used = false;
     {
         Render::CScopeGuard restore([&] {
@@ -375,15 +378,12 @@ static void drawPrimary(const CRegion& damage) {
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
                 glTexImage2D(GL_TEXTURE_2D, 0, GL_R32F, PQLut::count, 1, 0, GL_RED, GL_FLOAT, table.data());
             }
-            for (const auto flags : {Render::ShaderFeatureFlags(Render::SH_FEAT_CM), Render::ShaderFeatureFlags(Render::SH_FEAT_CM | Render::SH_FEAT_RGBA)}) {
+            for (const auto features : {Render::ShaderFeatureFlags(Render::SH_FEAT_CM), Render::ShaderFeatureFlags(Render::SH_FEAT_CM | Render::SH_FEAT_RGBA)}) {
+                const Render::SShaderVariant flags{.features=features, .sourceTF=NColorManagement::CM_TRANSFER_FUNCTION_EXT_LINEAR, .targetTF=NColorManagement::CM_TRANSFER_FUNCTION_ST2084_PQ};
                 const auto key = std::pair{g_state->shaderMode, flags};
                 if (!g_state->fastShaders.contains(key)) {
                     auto source = Render::g_pShaderLoader->getVariantSource(Render::SH_FRAG_SURFACE, flags);
-                    // Match identifiers rather than preprocessor whitespace.
-                    source = std::regex_replace(source, std::regex(R"(uniform\s+int\s+sourceTF\s*;)"), "const int sourceTF = 5;");
-                    source = std::regex_replace(source, std::regex(R"(uniform\s+int\s+targetTF\s*;)"), "const int targetTF = 11;");
-                    if (source.find("const int sourceTF = 5;") == std::string::npos || source.find("const int targetTF = 11;") == std::string::npos)
-                        throw std::runtime_error("Cannot specialize transfer functions");
+                    // Hyprland 0.57 specializes transfer functions in the variant key.
                     if (g_state->shaderMode == "lut") replacePQ(source);
                     if (g_state->shaderMode == "fetch")
                         source = std::regex_replace(source, std::regex(R"(texture\s*\(\s*tex\s*,\s*v_texcoord\s*\))"),
@@ -452,7 +452,7 @@ static void collectProfile() {
 #endif
 }
 
-static bool profileFrame(const CRegion& damage) {
+static bool profileFrame(Render::CRenderContext& ctx, const CRegion& damage) {
 #if GPU_SWITCH_DIAGNOSTICS
 
     if (g_state->shaderMode != "profile" || g_state->profileIssued >= 3) return false;
@@ -470,18 +470,18 @@ static bool profileFrame(const CRegion& damage) {
     glGenQueries(2, ids);
     auto& saved = g_state->restore;
     auto& gl = *Render::GL::g_pHyprOpenGL;
-    g_pHyprRenderer->bindFB(saved.work);
+    g_pHyprRenderer->bindFB(ctx, saved.work);
     glBeginQuery(elapsed, ids[0]);
-    g_pHyprRenderer->draw(saved.originalPass.at(saved.surfaceIndex).element, damage);
+    g_pHyprRenderer->draw(ctx, saved.originalPass.at(saved.surfaceIndex).element, damage);
     glEndQuery(elapsed);
-    g_pHyprRenderer->bindFB(saved.output);
+    g_pHyprRenderer->bindFB(ctx, saved.output);
     gl.blend(false);
     Render::GL::CHyprOpenGLImpl::STextureRenderData conversion{};
     conversion.damage = &damage;
     conversion.finalMonitorCM = true;
     glBeginQuery(elapsed, ids[1]);
-    const auto monitor = g_pHyprRenderer->m_renderData.pMonitor.lock();
-    gl.renderTexture(saved.work->getTexture(), CBox{{0, 0}, monitor->m_pixelSize}, conversion);
+    const auto monitor = ctx.m_data.pMonitor.lock();
+    gl.renderTexture(ctx, saved.work->getTexture(), CBox{{0, 0}, monitor->m_pixelSize}, conversion);
     glEndQuery(elapsed);
     gl.blend(true);
     g_state->pendingQueries.push_back({ids[0], ids[1]});
@@ -489,20 +489,21 @@ static bool profileFrame(const CRegion& damage) {
     return true;
 
 #else
+    (void)ctx;
     (void)damage;
     return false;
 #endif
 }
 
-static void drawSinglepassFrame() {
+static void drawSinglepassFrame(Render::CRenderContext& ctx) {
     auto& saved = g_state->restore;
-    auto& rd = g_pHyprRenderer->m_renderData;
+    auto& rd = ctx.m_data;
     auto& gl = *Render::GL::g_pHyprOpenGL;
     const CRegion fullDamage = rd.damage;
-    g_pHyprRenderer->bindFB(saved.output);
+    g_pHyprRenderer->bindFB(ctx, saved.output);
     collectProfile();
-    if (!profileFrame(fullDamage))
-        drawPrimary(fullDamage);
+    if (!profileFrame(ctx, fullDamage))
+        drawPrimary(ctx, fullDamage);
 
     if (saved.cursor && saved.cursorIndex) {
         // Reconstruct only the small cursor rectangle in the linear FP16 work
@@ -511,34 +512,34 @@ static void drawSinglepassFrame() {
         CRegion cursorDamage{saved.cursor->m_data.box};
         cursorDamage.expand(2).intersect(fullDamage);
         if (!cursorDamage.empty()) {
-            g_pHyprRenderer->bindFB(work);
+            g_pHyprRenderer->bindFB(ctx, work);
             rd.damage = cursorDamage;
-            const bool oldFeedback = g_pHyprRenderer->m_bBlockSurfaceFeedback;
-            const auto oldBuffers = g_pHyprRenderer->m_usedAsyncBuffers.size();
+            const bool oldFeedback = ctx.m_blockSurfaceFeedback;
+            const auto oldBuffers = ctx.m_usedAsyncBuffers.size();
             const auto originalTexture = saved.surface->m_data.texture;
             {
                 Render::CScopeGuard guard([&] {
-                    g_pHyprRenderer->m_bBlockSurfaceFeedback = oldFeedback;
-                    g_pHyprRenderer->m_usedAsyncBuffers.resize(oldBuffers);
+                    ctx.m_blockSurfaceFeedback = oldFeedback;
+                    ctx.m_usedAsyncBuffers.resize(oldBuffers);
                     saved.surface->m_data.texture = originalTexture;
                 });
-                g_pHyprRenderer->m_bBlockSurfaceFeedback = true;
-                if(!drawTransferredSurface(saved.originalPass.at(saved.surfaceIndex).element,cursorDamage))
-                    g_pHyprRenderer->draw(saved.originalPass.at(saved.surfaceIndex).element, cursorDamage);
+                ctx.m_blockSurfaceFeedback = true;
+                if(!drawTransferredSurface(ctx, saved.originalPass.at(saved.surfaceIndex).element,cursorDamage))
+                    g_pHyprRenderer->draw(ctx, saved.originalPass.at(saved.surfaceIndex).element, cursorDamage);
             }
             rd.damage = cursorDamage;
-            g_pHyprRenderer->draw(saved.originalPass.at(*saved.cursorIndex).element, cursorDamage);
-            g_pHyprRenderer->bindFB(saved.output);
+            g_pHyprRenderer->draw(ctx, saved.originalPass.at(*saved.cursorIndex).element, cursorDamage);
+            g_pHyprRenderer->bindFB(ctx, saved.output);
             gl.blend(false);
             const auto monitor = rd.pMonitor.lock();
             Render::GL::CHyprOpenGLImpl::STextureRenderData conversion{};
             conversion.damage = &cursorDamage;
             conversion.finalMonitorCM = true;
-            gl.renderTexture(work->getTexture(), CBox{{0, 0}, monitor->m_pixelSize}, conversion);
+            gl.renderTexture(ctx, work->getTexture(), CBox{{0, 0}, monitor->m_pixelSize}, conversion);
             gl.blend(true);
         }
     }
-    g_pHyprRenderer->bindFB(saved.output);
+    g_pHyprRenderer->bindFB(ctx, saved.output);
     rd.damage = fullDamage;
     // Allow Hyprland's normal end-of-frame invalidation to retire the work FB.
     saved.work.reset();
@@ -546,15 +547,15 @@ static void drawSinglepassFrame() {
 
 class CSinglepassElement : public IPassElement {
   public:
-    std::vector<UP<IPassElement>> draw() override {
-        drawSinglepassFrame();
+    std::vector<UP<IPassElement>> draw(Render::CRenderContext& ctx) override {
+        drawSinglepassFrame(ctx);
         return {};
     }
-    bool needsLiveBlur() override { return false; }
-    bool needsPrecomputeBlur() override { return false; }
+    bool needsLiveBlur(Render::CRenderContext&) override { return false; }
+    bool needsPrecomputeBlur(Render::CRenderContext&) override { return false; }
     const char* passName() override { return "CHDRSinglepassElement"; }
     ePassElementType type() override { return EK_CUSTOM; }
-    bool undiscardable() override { return true; }
+    bool undiscardable(Render::CRenderContext&) override { return true; }
 };
 
 static bool covers(const CRegion& region, const CBox& output) {
@@ -593,14 +594,14 @@ static bool identityInput(CSurfacePassElement& element, PHLMONITOR monitor) {
     return maxSource < maxWork * 1.01;
 }
 
-void GpuSwitch::observeRenderedSurface(CSurfacePassElement* surface) {
+void GpuSwitch::observeRenderedSurface(Render::CRenderContext& ctx, CSurfacePassElement* surface) {
     if(!g_state || !g_state->capturePacing || !surface)return;
-    const auto monitor=g_pHyprRenderer->m_renderData.pMonitor.lock();
+    const auto monitor=ctx.m_data.pMonitor.lock();
     if(monitor && surface->m_data.surface)observeContentSurface(surface->m_data.surface,monitor);
 }
 
-static CSurfacePassElement* eligibleSurface(PHLMONITOR monitor) {
-    auto& pass = g_pHyprRenderer->currentPass();
+static CSurfacePassElement* eligibleSurface(Render::CRenderContext& ctx, PHLMONITOR monitor) {
+    auto& pass = g_pHyprRenderer->currentPass(ctx);
     std::string names;
     for (const auto& item : pass.m_passElements) {
         if (!names.empty())
@@ -613,7 +614,7 @@ static CSurfacePassElement* eligibleSurface(PHLMONITOR monitor) {
         }
     }
     g_state->lastPassInfo = std::format("{} elements: {}", pass.m_passElements.size(), names);
-    if (&pass != &g_pHyprRenderer->m_renderPass || pass.m_passElements.empty())
+    if (&pass != &ctx.m_pass || pass.m_passElements.empty())
         return nullptr;
     auto index = pass.m_passElements.size() - 1;
     g_state->candidateCursor.reset();
@@ -621,7 +622,7 @@ static CSurfacePassElement* eligibleSurface(PHLMONITOR monitor) {
     if (top && top->type() == EK_TEXTURE) {
         const auto* cursor = dynamic_cast<CTexPassElement*>(top.get());
         if (!cursor || index == 0 || cursor->m_data.tex != Pointer::mgr()->getCurrentCursorTexture() || cursor->m_data.blur || cursor->m_data.motionBlur.enabled ||
-            cursor->m_data.box.w > 256 || cursor->m_data.box.h > 256 || cursor->m_data.useMirrorProjection)
+            cursor->m_data.box.w > 256 || cursor->m_data.box.h > 256 || cursor->m_data.workspacePresentation.workspaceScene)
             return nullptr;
         g_state->candidateCursor = index--;
     }
@@ -649,8 +650,8 @@ static CSurfacePassElement* eligibleSurface(PHLMONITOR monitor) {
         if (attrs.success)
             g_state->textureInfo += std::format(" fourcc={:08x} modifier={:x} stride={} planes={}", attrs.format, attrs.modifier, attrs.strides[0], attrs.planes);
     }
-    if (!surface->m_data.dontRound || surface->m_data.alpha != 1.F || surface->m_data.fadeAlpha != 1.F || !solitary->opaque()) {
-        g_state->lastPassInfo += std::format(" (dontRound={} alpha={} fade={} opaque={})", surface->m_data.dontRound, surface->m_data.alpha, surface->m_data.fadeAlpha, solitary->opaque());
+    if (!surface->m_data.dontRound || surface->m_data.alpha != 1.F || surface->m_data.fadeAlpha != 1.F || !solitary->presentation().opaque(surface->m_data.workspacePresentation)) {
+        g_state->lastPassInfo += std::format(" (dontRound={} alpha={} fade={} opaque={})", surface->m_data.dontRound, surface->m_data.alpha, surface->m_data.fadeAlpha, solitary->presentation().opaque(surface->m_data.workspacePresentation));
         return nullptr;
     }
     if (!surface->m_data.clipBox.empty() || !surface->m_data.texture || !surface->m_data.texture->ok()) {
@@ -658,7 +659,7 @@ static CSurfacePassElement* eligibleSurface(PHLMONITOR monitor) {
         return nullptr;
     }
     const CBox box{{0, 0}, monitor->m_transformedSize / monitor->m_scale};
-    if (!covers(surface->opaqueRegion(), box)) {
+    if (!covers(surface->opaqueRegion(ctx), box)) {
         g_state->lastPassInfo += " (opaque region does not cover output)";
         return nullptr;
     }
@@ -667,16 +668,16 @@ static CSurfacePassElement* eligibleSurface(PHLMONITOR monitor) {
     for (size_t i = 0; i < index; ++i) {
         const auto& below = pass.m_passElements.at(i).element;
         const auto* s = below ? dynamic_cast<CSurfacePassElement*>(below.get()) : nullptr;
-        if (!s || s->m_data.pWindow != solitary || s->m_data.popup || below->undiscardable())
+        if (!s || s->m_data.pWindow != solitary || s->m_data.popup || below->undiscardable(ctx))
             return nullptr;
     }
     return surface;
 }
 
-static void considerFrame() {
+static void considerFrame(Render::CRenderContext& ctx) {
     if (!g_state || !g_pHyprRenderer || !Render::GL::g_pHyprOpenGL)
         return;
-    auto& rd = g_pHyprRenderer->m_renderData;
+    auto& rd = ctx.m_data;
     const auto monitor = rd.pMonitor.lock();
     if (!monitor) return;
     if ((!g_state->outputName.empty() && monitor->m_name!=g_state->outputName) || !monitor->inHDR())return;
@@ -689,20 +690,20 @@ static void considerFrame() {
         g_state->lastReason = "disabled";
         if (wasFast) {
             const CRegion full{CBox{{0, 0}, monitor->m_pixelSize}};
-            g_pHyprRenderer->setDamage(full, full);
+            g_pHyprRenderer->setDamage(ctx, full, full);
             wasFast = false;
         }
         return;
     }
     auto& gl = *Render::GL::g_pHyprOpenGL;
-    auto* surface = eligibleSurface(monitor);
+    auto* surface = eligibleSurface(ctx, monitor);
     static auto cmEnabled = CConfigValue<Config::INTEGER>("render:cm_enabled");
     const CBox outputBox{{0, 0}, monitor->m_pixelSize};
     const bool format10 = monitor->m_drmFormat == DRM_FORMAT_XRGB2101010 || monitor->m_drmFormat == DRM_FORMAT_XBGR2101010;
     Singlepass::SConditions c{
         .enabled = g_state->enabled,
         .targetOutput = true,
-        .normalGLFrame = g_pHyprRenderer->m_renderMode == Render::RENDER_MODE_NORMAL && !gl.m_fakeFrame && gl.m_offloadedFramebuffer && rd.outFB && rd.mainFB && rd.currentFB == rd.mainFB,
+        .normalGLFrame = ctx.m_mode == Render::RENDER_MODE_NORMAL && !ctx.m_gl.fakeFrame && ctx.m_gl.offloadedFramebuffer && rd.outFB && rd.mainFB && rd.currentFB == rd.mainFB,
         .hdrFP16 = monitor->inHDR() && monitor->useFP16() && format10 && *cmEnabled && !monitor->m_imageDescription->value().icc.present,
         .noCapture = !monitor->needsACopyFB() && monitor->m_mirrors.empty() && !(g_state->uniformCapture && Screenshare::mgr()->outputCopyFBState(monitor).sharingSessions > 0),
         .noPostprocessing = !g_pHyprRenderer->m_crashingInProgress && (!gl.m_finalScreenShader || gl.m_finalScreenShader->program() == 0) && rd.mouseZoomFactor == 1.F && rd.renderModif.modifs.empty() && monitor->m_scale == 1 && monitor->m_transform == WL_OUTPUT_TRANSFORM_NORMAL && !monitor->doesNoShaderCM() && monitor->m_ctm == Mat3x3::identity(),
@@ -716,7 +717,7 @@ static void considerFrame() {
         g_state->lastReason = reason;
         if (wasFast) {
             const CRegion full{outputBox};
-            g_pHyprRenderer->setDamage(full, full);
+            g_pHyprRenderer->setDamage(ctx, full, full);
             wasFast = false;
         }
         return;
@@ -733,7 +734,7 @@ static void considerFrame() {
     saved.description = rd.outFB->imageDescription();
     saved.surface = surface;
     saved.blur = surface->m_data.blur;
-    saved.pass = &g_pHyprRenderer->currentPass();
+    saved.pass = &g_pHyprRenderer->currentPass(ctx);
     saved.surfaceIndex = g_state->candidateIndex;
     saved.cursorIndex = g_state->candidateCursor;
     if (saved.cursorIndex)
@@ -744,19 +745,19 @@ static void considerFrame() {
     saved.pass->m_passElements.emplace_back(std::move(optimizedPass));
     for (size_t i = 0; i < saved.surfaceIndex; ++i) {
         saved.originalPass[i].discard = true;
-        saved.originalPass[i].element->discard();
+        saved.originalPass[i].element->discard(ctx);
     }
     rd.outFB->setImageDescription(monitor->m_imageDescription);
     surface->m_data.blur = false; // An opaque fullscreen surface hides its backdrop.
-    g_pHyprRenderer->bindFB(rd.outFB);
+    g_pHyprRenderer->bindFB(ctx, rd.outFB);
     rd.mainFB = rd.outFB;
-    gl.m_offloadedFramebuffer = false;
+    ctx.m_gl.offloadedFramebuffer = false;
     ++g_state->optimized;
     wasFast = true;
     g_state->lastReason = "single pass";
 }
 
-static std::string status(eHyprCtlOutputFormat, std::string) {
+static std::string status(IPC::Socket1::eOutputFormat, std::string) {
     if (!g_state)
         return "not initialized";
     std::string profile = "[";
@@ -858,7 +859,7 @@ static Screenshare::eScreenshareError pacedShare(Screenshare::CScreenshareFrame*
 static bool setCapturePacing(bool enable) {
     if (enable && !g_shareHook) {
         std::vector<SFunctionMatch> matches;
-        for (const auto& match : HyprlandAPI::findFunctionsByName(g_handle, "share"))
+        for (const auto& match : GpuSwitch::findHookFunctions(g_handle, "share"))
             if (match.demangled.find("Screenshare::CScreenshareFrame::share(") != std::string::npos) matches.push_back(match);
         if (matches.size() != 1) return false;
         g_shareHook = HyprlandAPI::createFunctionHook(g_handle, matches[0].address, reinterpret_cast<void*>(&pacedShare));
@@ -923,11 +924,11 @@ static SDispatchResult dispatch(std::string args) {
         return {.success = false, .error = "Use gpu-render on|off|reset|stock|specialized|lut"};
     if (args == "on" || args == "off")
         forceTargetRepaint();
-    Log::logger->log(Log::INFO, "[hyprland-gpu-switch:offload] {}", status(FORMAT_JSON, ""));
+    LOG(Log::INFO, "[hyprland-gpu-switch:offload] {}", status(IPC::Socket1::FORMAT_JSON, ""));
     return {};
 }
 
-static std::string controlRequest(eHyprCtlOutputFormat format, std::string request) {
+static std::string controlRequest(IPC::Socket1::eOutputFormat format, std::string request) {
     std::istringstream words(request);
     std::string name, action, extra;
     words >> name >> action >> extra;
@@ -962,6 +963,13 @@ static std::string controlRequest(eHyprCtlOutputFormat format, std::string reque
     return result.success ? "ok" : "error: " + result.error;
 }
 
+static int renderingControlLua(lua_State* lua) {
+    const auto action=luaL_optstring(lua,1,"status");
+    const auto response=controlRequest(IPC::Socket1::FORMAT_JSON,std::string{"gpu-render "}+action);
+    lua_pushlstring(lua,response.data(),response.size());
+    return 1;
+}
+
 void GpuSwitch::initRenderingOptimizations(HANDLE handle) {
     const std::string serverHash = __hyprland_api_get_hash();
     const std::string clientHash = __hyprland_api_get_client_hash();
@@ -974,32 +982,34 @@ void GpuSwitch::initRenderingOptimizations(HANDLE handle) {
     g_state->captureReadyTimer = makeShared<CEventLoopTimer>(std::nullopt, [](SP<CEventLoopTimer>, void*) { copyReadyCaptures(); }, nullptr);
     g_pEventLoopManager->addTimer(g_state->captureReadyTimer);
     std::vector<SFunctionMatch> copyFBMatches;
-    for (const auto& match : HyprlandAPI::findFunctionsByName(g_handle, "needsACopyFB"))
+    for (const auto& match : GpuSwitch::findHookFunctions(g_handle, "needsACopyFB"))
         if (match.demangled == "Monitor::CMonitor::needsACopyFB()") copyFBMatches.push_back(match);
     if (copyFBMatches.size() != 1) throw std::runtime_error("hyprland-gpu-switch: ambiguous copy-FB hook");
     g_copyFBHook = HyprlandAPI::createFunctionHook(g_handle, copyFBMatches[0].address, reinterpret_cast<void*>(&captureNeedsCopyFB));
     if (!g_copyFBHook || !g_copyFBHook->hook()) throw std::runtime_error("hyprland-gpu-switch: cannot hook copy-FB policy");
     std::vector<SFunctionMatch> vrrMatches;
-    for(const auto& match:HyprlandAPI::findFunctionsByName(g_handle,"ensureVRR"))
+    for(const auto& match:GpuSwitch::findHookFunctions(g_handle,"ensureVRR"))
         if(match.demangled.starts_with("Config::CMonitorRuleManager::ensureVRR("))vrrMatches.push_back(match);
     if(vrrMatches.size()!=1)throw std::runtime_error("ambiguous VRR hook");
     g_ensureVRRHook=HyprlandAPI::createFunctionHook(g_handle,vrrMatches[0].address,reinterpret_cast<void*>(&hkEnsureVRR));
     if(!g_ensureVRRHook || !g_ensureVRRHook->hook())throw std::runtime_error("cannot hook VRR capability handling");
     if (!setCapturePacing(true)) throw std::runtime_error("hyprland-gpu-switch: cannot enable independent capture pacing");
-    g_state->stageListener = Event::bus()->m_events.render.stage.listen([](eRenderStage stage) {
-        if (stage == RENDER_LAST_MOMENT) {
-            const auto monitor = g_pHyprRenderer->m_renderData.pMonitor.lock();
+    g_state->stageListener = Event::bus()->m_events.render.stage.listen([](const Event::SRenderStageEvent& event) {
+        const auto stage=event.stage;
+        if (stage == RENDER_LAST_MOMENT && event.context) {
+            auto& ctx=event.context->get();
+            const auto monitor = ctx.m_data.pMonitor.lock();
             if (monitor && (g_state->outputName.empty() || monitor->m_name == g_state->outputName)) traceEvent("render", monitor);
-            if(g_state->capturePacing && monitor)for(const auto& item:g_pHyprRenderer->currentPass().m_passElements)
+            if(g_state->capturePacing && monitor)for(const auto& item:g_pHyprRenderer->currentPass(ctx).m_passElements)
                 if(auto* surface=item.element?dynamic_cast<CSurfacePassElement*>(item.element.get()):nullptr;surface && surface->m_data.surface)
                     observeContentSurface(surface->m_data.surface,monitor);
-            considerFrame();
+            considerFrame(ctx);
         }
         else if (stage == RENDER_POST)
             restoreFrameMetadata();
         });
-    if(!HyprlandAPI::addDispatcherV2(handle,"gpu-render",dispatch))
-        throw std::runtime_error("hyprland-gpu-switch: cannot register rendering dispatcher");
+    if(!HyprlandAPI::addLuaFunction(handle,"gpu_switch","rendering",renderingControlLua))
+        throw std::runtime_error("hyprland-gpu-switch: cannot register rendering Lua control");
 
 }
 
@@ -1017,7 +1027,7 @@ void GpuSwitch::exitRenderingOptimizations() {
     restoreFrameMetadata();
     forceTargetRepaint();
     g_state->stageListener.reset();
-    HyprlandAPI::removeDispatcher(g_handle,"gpu-render");
+    HyprlandAPI::removeLuaFunction(g_handle,"gpu_switch","rendering");
     if (Render::GL::g_pHyprOpenGL) {
         Render::GL::g_pHyprOpenGL->makeEGLCurrent();
         for (const auto query : g_state->pendingQueries) {
@@ -1032,5 +1042,5 @@ void GpuSwitch::exitRenderingOptimizations() {
 
 std::string GpuSwitch::renderingOptimizationsControl(const std::string& arguments) {
     if(!g_state)return "rendering optimizations are suspended";
-    return controlRequest(FORMAT_JSON,"gpu-render "+arguments);
+    return controlRequest(IPC::Socket1::FORMAT_JSON,"gpu-render "+arguments);
 }

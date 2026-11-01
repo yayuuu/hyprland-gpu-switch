@@ -6,10 +6,10 @@
 #include <hyprland/src/state/MonitorState.hpp>
 #include <hyprland/src/protocols/core/Compositor.hpp>
 #include <hyprland/src/event/EventBus.hpp>
-#include <hyprland/src/debug/HyprCtl.hpp>
+#include <hyprland/src/ipc/s1/S1.hpp>
 #include "../transfer/queued_state.hpp"
 static HANDLE handle;
-static SP<SHyprCtlCommand> command;
+static SP<IPC::Socket1::SCommand> command;
 static CHyprSignalListener presentation,stages;
 using Clock=std::chrono::steady_clock;
 static std::vector<double> presents,renders,durations;
@@ -36,17 +36,20 @@ APICALL EXPORT std::string PLUGIN_API_VERSION(){return HYPRLAND_API_VERSION;}
 APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE h){
     if(std::string(__hyprland_api_get_hash())!=std::string(__hyprland_api_get_client_hash()))throw std::runtime_error("ABI mismatch");
     handle=h;
-    command=HyprlandAPI::registerHyprCtlCommand(h,{.name="gpu-frame-probe",.exact=false,.fn=[](eHyprCtlOutputFormat,std::string request){
+    command=HyprlandAPI::registerHyprCtlCommand(h,{.name="gpu-frame-probe",.match=IPC::Socket1::COMMAND_MATCH_PREFIX,.handler=[](const IPC::Socket1::SRequest& ipcRequest) -> IPC::Socket1::SResponse {
+ const auto& request=ipcRequest.command;
         std::istringstream words(request);std::string name,action;words>>name>>action;
         if(action=="start"){
             detach();watches.clear();presents.clear();renders.clear();durations.clear();begin.reset();start=Clock::now();
             for(auto& m:State::monitorState()->monitors())if(m->m_name=="DP-1")presentation=m->m_events.presented.listen([](const Time::steady_tp& time){record(presents,std::chrono::duration<double,std::milli>(time-start).count());});
-            stages=Event::bus()->m_events.render.stage.listen([](eRenderStage stage){
-                if(stage==RENDER_BEGIN){const auto m=g_pHyprRenderer->m_renderData.pMonitor.lock();if(m && m->m_name=="DP-1"){begin=now();record(renders,*begin);}}
+            stages=Event::bus()->m_events.render.stage.listen([](const Event::SRenderStageEvent& event){
+                const auto stage=event.stage;
+                if(stage==RENDER_BEGIN){const auto m=event.monitor;if(m && m->m_name=="DP-1"){begin=now();record(renders,*begin);}}
                 else if(stage==RENDER_POST && begin){record(durations,now()-*begin);begin.reset();}
             });
             PROTO::compositor->forEachSurface([](SP<CWLSurfaceResource> surface){
-                if(!surface->m_current.buffer)return;auto a=surface->m_current.buffer->dmabuf();
+                if(!surface->m_current.buffer)return;
+                auto a=surface->m_current.buffer->dmabuf();
                 if(!a.success || a.size.x<3000 || a.size.y<1000)return;
                 auto w=std::make_unique<Watch>();w->surface=surface;wl_client_get_credentials(surface->client(),&w->pid,nullptr,nullptr);auto ptr=w.get();
                 w->queueTimes.reserve(2000);w->commitTimes.reserve(2000);

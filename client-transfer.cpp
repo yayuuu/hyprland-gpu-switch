@@ -20,14 +20,16 @@
 #undef private
 
 #include <hyprland/src/Compositor.hpp>
+#include <hyprland/src/desktop/view/window/WindowMetadata.hpp>
 #include <hyprland/src/config/ConfigValue.hpp>
-#include <hyprland/src/debug/HyprCtl.hpp>
+#include <hyprland/src/ipc/s1/S1.hpp>
 #include <hyprland/src/debug/log/Logger.hpp>
 #include <hyprland/src/desktop/view/WLSurface.hpp>
 #include <hyprland/src/event/EventBus.hpp>
 #include <hyprland/src/output/Monitor.hpp>
 #include <hyprland/src/pointer/PointerManager.hpp>
 #include <hyprland/src/plugins/PluginAPI.hpp>
+#include "function-hooks.hpp"
 #include "client-transfer.hpp"
 #include "rendering-optimizations.hpp"
 #include <hyprland/src/plugins/PluginSystem.hpp>
@@ -59,7 +61,7 @@
 #include "transfer/idle-policy.hpp"
 #include "probe.hpp"
 
-static_assert(std::string_view{GIT_COMMIT_HASH} == "efb50993780079460b0cbed1363e2166a2de1d9f", "Build against Hyprland v0.56.2 headers");
+static_assert(std::string_view{GIT_COMMIT_HASH} == "0aa6745f705f2c4b0a5004eb019ef76e5bbdb426", "Build against Hyprland v0.57.0 headers");
 static_assert(std::string_view{GPU_TRANSFER_AQ_VERSION}.substr(0, 4) == "0.15", "Build against Aquamarine 0.15.x headers");
 
 static HANDLE g_handle=nullptr;
@@ -141,7 +143,7 @@ struct SState {
             SNV* session=nullptr;
             WP<Render::ITexture> texture;
             NColorManagement::PImageDescription savedDescription;
-            std::optional<decltype(g_pHyprRenderer->m_cmSettingsCache)> savedCMCache;
+            std::optional<decltype(g_pHyprRenderer->context().m_cmSettingsCache)> savedCMCache;
             std::optional<unsigned> slot;
             bool bound = false, nativeLayout = false;
             std::string layoutReason;
@@ -169,9 +171,11 @@ static void setVramInputInactiveForSession(SState::SNV*);
 static void retireVramSession();
 
 static void maintainOffload();
-static void wrapOffloadSurfaces(bool subpass=false);
-static void unwrapOffloadSurfaces(Render::CRenderPass* pass=nullptr);
+static void wrapOffloadSurfaces(Render::CRenderContext& ctx, bool subpass=false);
+static void unwrapOffloadSurfaces(Render::CRenderContext& ctx, Render::CRenderPass* pass=nullptr);
 static void preconvertCommittedFrame();
+static Render::CRenderContext* g_transferContext=nullptr;
+static Render::CRenderContext& transferContext() { return g_transferContext?*g_transferContext:g_pHyprRenderer->context(); }
 static bool isProtectedInput(Render::ITexture* texture);
 static bool isNativeInput(Render::ITexture* texture);
 static std::string describeVramInput(Render::ITexture* texture);
@@ -203,7 +207,7 @@ static bool workerCanStayWarm(const SState::SNV& nv,PHLWINDOW owner) {
         struct stat info{};
         if(!fstat(backend->gpu->fd,&info) && Offload::deviceID(info.st_rdev)==nv.sourceGPU->id)sourceHasActiveOutput=true;
     }
-    return Offload::keepWorkerWarm(owner && owner->m_isMapped,g_state->enabled && nv.enabled,
+    return Offload::keepWorkerWarm(owner && owner->mapped(),g_state->enabled && nv.enabled,
         displayActive,GpuSwitch::knownGpuRole(nv.sourceGPU->id)==GpuSwitch::Role::Integrated,sourceHasActiveOutput);
 }
 
@@ -214,7 +218,7 @@ static void maintainOffload() {
     const auto owner = nv.owner.lock();
     const auto now = std::chrono::steady_clock::now();
     const bool haveTextures = std::ranges::any_of(nv.slots, [](const auto& slot) { return bool(slot.texture) || slot.outputFD.value >= 0 || slot.conversionComplete.value >= 0; });
-    const bool idle = !g_state->enabled || !nv.enabled || !owner || !owner->m_isMapped ||
+    const bool idle = !g_state->enabled || !nv.enabled || !owner || !owner->mapped() ||
         (!workerCanStayWarm(nv,owner) && now - nv.lastDraw > std::chrono::milliseconds(500));
     if (!nv.stopRequested && !(idle && nv.client.running()) && !(haveTextures && !nv.client.running())) {
         if (nv.client.running()) nv.client.checkReady();
@@ -326,12 +330,12 @@ static bool materializeOffload(SState::SNVSlot& slot, NColorManagement::PImageDe
     return true;
 }
 
-static std::optional<PreparedTexture> prepareOffloadTexture(CSurfacePassElement& element, PHLMONITOR monitor, bool fullscreen, bool submissionOnly = false) {
+static std::optional<PreparedTexture> prepareOffloadTexture(Render::CRenderContext& ctx, CSurfacePassElement& element, PHLMONITOR monitor, bool fullscreen, bool submissionOnly = false) {
     auto& data = element.m_data;
     if (!g_state->enabled || !monitor || !data.texture || !data.texture->ok() || !data.pWindow || !data.surface || !data.surface->m_current.buffer || !g_pHyprRenderer->explicitSyncSupported()) return std::nullopt;
     static auto cmEnabled = CConfigValue<Config::INTEGER>("render:cm_enabled");
     const bool hdrConversion=*cmEnabled && !monitor->doesNoShaderCM() && monitor->m_imageDescription && monitor->m_imageDescription->value().transferFunction==NColorManagement::CM_TRANSFER_FUNCTION_ST2084_PQ;
-    const auto pid = data.pWindow->getPID();
+    const auto pid = data.pWindow->backend().pid();
     auto attrs = data.surface->m_current.buffer->dmabuf();
     if(!attrs.success)return std::nullopt;
     pid_t clientPID=0;wl_client_get_credentials(data.surface->client(),&clientPID,nullptr,nullptr);
@@ -387,9 +391,9 @@ static std::optional<PreparedTexture> prepareOffloadTexture(CSurfacePassElement&
     packedData.primariesNamed = CM_PRIMARIES_BT2020;
     packedData.primaries = NColorPrimaries::BT2020;
     const auto packed = copyOnly?source:fullscreen ? monitor->m_imageDescription : CImageDescription::from(packedData);
-    const auto settings = fullscreen ? g_pHyprRenderer->getCMSettings(source, packed, data.surface, true,
+    const auto settings = fullscreen ? g_pHyprRenderer->getCMSettings(ctx, source, packed, data.surface, true,
         monitor->m_sdrMinLuminance, monitor->m_sdrMaxLuminance, true) :
-        g_pHyprRenderer->getCMSettings(source, packed, nullptr, false, -1, -1, false);
+        g_pHyprRenderer->getCMSettings(ctx, source, packed, nullptr, false, -1, -1, false);
     if (!copyOnly && (settings.sourceTF != CM_TRANSFER_FUNCTION_EXT_LINEAR || settings.targetTF != CM_TRANSFER_FUNCTION_ST2084_PQ ||
         settings.needsTonemap || settings.needsSDRmod || settings.dstTFRange.max <= settings.dstTFRange.min)) {
         nv.reason = "unsupported color transform"; return std::nullopt;
@@ -522,13 +526,13 @@ static void preconvertCommittedFrame() {
         std::chrono::steady_clock::now() - nv.lastDraw > std::chrono::milliseconds(250)) return;
     const auto owner = nv.owner.lock();
     const auto surface = nv.sourceSurface.lock();
-    if (!owner || !owner->m_isMapped || !surface || !surface->m_current.buffer || !surface->m_current.texture) return;
+    if (!owner || !owner->mapped() || !surface || !surface->m_current.buffer || !surface->m_current.texture) return;
     const auto monitor = owner->m_monitor.lock();
     if (!monitor) return;
     CSurfacePassElement::SRenderData data{}; data.surface = surface; data.texture = surface->m_current.texture; data.pWindow = owner;
     CSurfacePassElement element{data};
     const auto before = nv.frames;
-    prepareOffloadTexture(element, monitor, false, true);
+    prepareOffloadTexture(g_pHyprRenderer->context(), element, monitor, false, true);
     if (nv.frames > before) ++nv.eagerFrames;
 }
 
@@ -564,66 +568,67 @@ class COffloadSurfaceElement : public IPassElement {
     bool fullscreen = false;
     explicit COffloadSurfaceElement(UP<IPassElement>&& element, bool early = false) : original(std::move(element)), subpass(early) {}
     CSurfacePassElement* surface() const { return dynamic_cast<CSurfacePassElement*>(original.get()); }
-    bool needsLiveBlur() override { return original->needsLiveBlur(); }
-    bool needsPrecomputeBlur() override { return original->needsPrecomputeBlur(); }
-    bool undiscardable() override { return original->undiscardable(); }
-    bool disableSimplification() override { return original->disableSimplification(); }
-    std::optional<CBox> boundingBox() override { return original->boundingBox(); }
-    CRegion opaqueRegion() override { return original->opaqueRegion(); }
-    void discard() override { original->discard(); }
+    bool needsLiveBlur(Render::CRenderContext& ctx) override { return original->needsLiveBlur(ctx); }
+    bool needsPrecomputeBlur(Render::CRenderContext& ctx) override { return original->needsPrecomputeBlur(ctx); }
+    bool undiscardable(Render::CRenderContext& ctx) override { return original->undiscardable(ctx); }
+    bool disableSimplification(Render::CRenderContext& ctx) override { return original->disableSimplification(ctx); }
+    bool requiresFullDamage(Render::CRenderContext& ctx) override { return original->requiresFullDamage(ctx); }
+    std::optional<CBox> boundingBox(Render::CRenderContext& ctx) override { return original->boundingBox(ctx); }
+    CRegion opaqueRegion(Render::CRenderContext& ctx) override { return original->opaqueRegion(ctx); }
+    void discard(Render::CRenderContext& ctx) override { original->discard(ctx); }
     const char* passName() override { return "CGpuTransferSurfaceElement"; }
     ePassElementType type() override { return EK_CUSTOM; }
-    std::vector<UP<IPassElement>> draw() override {
-        auto& rd = g_pHyprRenderer->m_renderData;
+    std::vector<UP<IPassElement>> draw(Render::CRenderContext& ctx) override {
+        auto& rd = ctx.m_data;
         const auto damage = rd.damage;
         auto* element = surface();
         const auto source = sourceDescription(*element);
-        const auto prepared = prepareOffloadTexture(*element, rd.pMonitor.lock(), fullscreen);
-        if (!prepared) { g_pHyprRenderer->draw(original, damage); return {}; }
+        const auto prepared = prepareOffloadTexture(ctx, *element, rd.pMonitor.lock(), fullscreen);
+        if (!prepared) { g_pHyprRenderer->draw(ctx, original, damage); return {}; }
         SessionScope selected(prepared->session);
         auto& slot = currentNV().slots[prepared->slot];
         auto texture = element->m_data.texture;
         {
-            const auto used = g_pHyprRenderer->m_usedAsyncBuffers.size();
+            const auto used = ctx.m_usedAsyncBuffers.size();
             Render::CScopeGuard restore([&] {
                 element->m_data.texture = texture;
-                if (currentNV().earlyRelease) g_pHyprRenderer->m_usedAsyncBuffers.resize(used);
+                if (currentNV().earlyRelease) ctx.m_usedAsyncBuffers.resize(used);
             });
             element->m_data.texture = slot.texture;
-            if(currentNV().client.copyOnly)g_pHyprRenderer->draw(original,damage);
+            if(currentNV().client.copyOnly)g_pHyprRenderer->draw(ctx, original,damage);
             else {
             // Hyprland treats PQ -> SDR differently from scRGB -> SDR. Keep the
             // original content tone-map parameters while decoding packed PQ.
             // All primaries/TF ranges still describe the actual packed texture.
-            const auto cache = g_pHyprRenderer->m_cmSettingsCache;
+            const auto cache = ctx.m_cmSettingsCache;
             const auto previousSurface = rd.surface;
             const auto previousWindow = rd.currentWindow;
             rd.surface = element->m_data.surface;
             rd.currentWindow = element->m_data.pWindow;
             Render::CScopeGuard restoreCM([&] {
-                g_pHyprRenderer->m_cmSettingsCache = cache;
+                ctx.m_cmSettingsCache = cache;
                 rd.surface = previousSurface; rd.currentWindow = previousWindow;
             });
             const auto target = rd.currentFB->imageDescription();
-            auto originalSettings = g_pHyprRenderer->getCMSettings(source, target, element->m_data.surface, true,
+            auto originalSettings = g_pHyprRenderer->getCMSettings(ctx, source, target, element->m_data.surface, true,
                 rd.pMonitor->m_sdrMinLuminance, rd.pMonitor->m_sdrMaxLuminance, true);
             const auto packed = slot.texture->m_imageDescription;
-            auto packedSettings = g_pHyprRenderer->getCMSettings(packed, target, element->m_data.surface, true,
+            auto packedSettings = g_pHyprRenderer->getCMSettings(ctx, packed, target, element->m_data.surface, true,
                 rd.pMonitor->m_sdrMinLuminance, rd.pMonitor->m_sdrMaxLuminance, true);
             packedSettings.needsTonemap = originalSettings.needsTonemap;
             packedSettings.tonemapMode = originalSettings.tonemapMode;
             packedSettings.maxLuminance = originalSettings.maxLuminance;
             packedSettings.dstMaxLuminance = originalSettings.dstMaxLuminance;
-            for (auto& entry : g_pHyprRenderer->m_cmSettingsCache)
+            for (auto& entry : ctx.m_cmSettingsCache)
                 if (entry.srcDescId == packed->id() && entry.dstDescId == target->id()) entry.settings = packedSettings;
-            g_pHyprRenderer->draw(original, damage);
+            g_pHyprRenderer->draw(ctx, original, damage);
             }
         }
         // Dedicated read fence works for normal composition AND independent
         // capture passes, including FULL_FAKE passes with no monitor in-fence.
         auto fence = g_pHyprRenderer->createSyncFDManager();
         if (fence && fence->isValid()) {
-            if (g_pHyprRenderer->m_renderMode == Render::RENDER_MODE_FULL_FAKE && !currentNV().earlyRelease) {
+            if (ctx.m_mode == Render::RENDER_MODE_FULL_FAKE && !currentNV().earlyRelease) {
                 // FULL_FAKE skips the core's async-buffer release fence. Protect
                 // the source from client reuse until our conversion has ended.
                 const auto input = element->m_data.surface->m_current.buffer;
@@ -634,18 +639,18 @@ class COffloadSurfaceElement : public IPassElement {
         } else { glFinish(); requestOffloadStop(); }
         ++currentNV().windowFrames;
         if (subpass) ++g_state->subpassFrames;
-        currentNV().route = subpass ? "subpass composition" : (g_pHyprRenderer->m_renderMode == Render::RENDER_MODE_NORMAL ? "composition" : "window capture");
-        if (g_pHyprRenderer->m_renderMode != Render::RENDER_MODE_NORMAL) ++currentNV().captureFrames;
+        currentNV().route = subpass ? "subpass composition" : (ctx.m_mode == Render::RENDER_MODE_NORMAL ? "composition" : "window capture");
+        if (ctx.m_mode != Render::RENDER_MODE_NORMAL) ++currentNV().captureFrames;
         return {};
     }
 };
 
-static void wrapOffloadSurfaces(bool subpass) {
+static void wrapOffloadSurfaces(Render::CRenderContext& ctx, bool subpass) {
     if (!g_state || !g_state->enabled || !currentNV().enabled || !Render::GL::g_pHyprOpenGL) return;
     // Only the main transient render pass is owned here. Nested transformer
     // passes may outlive this frame and must not retain plugin vtables.
-    if (&g_pHyprRenderer->currentPass() != &g_pHyprRenderer->m_renderPass) return;
-    for (auto& item : g_pHyprRenderer->currentPass().m_passElements) {
+    if (&g_pHyprRenderer->currentPass(ctx) != &ctx.m_pass) return;
+    for (auto& item : g_pHyprRenderer->currentPass(ctx).m_passElements) {
         auto* surface = item.element ? dynamic_cast<CSurfacePassElement*>(item.element.get()) : nullptr;
         if (!surface || !surface->m_data.pWindow || !surface->m_data.texture) continue;
         const auto source = sourceDescription(*surface);
@@ -654,8 +659,8 @@ static void wrapOffloadSurfaces(bool subpass) {
     }
 }
 
-static void unwrapOffloadSurfaces(Render::CRenderPass* pass) {
-    if (!pass) pass = &g_pHyprRenderer->currentPass();
+static void unwrapOffloadSurfaces(Render::CRenderContext& ctx, Render::CRenderPass* pass) {
+    if (!pass) pass = &g_pHyprRenderer->currentPass(ctx);
     for (auto& item : pass->m_passElements)
         if (auto* wrapped = item.element ? dynamic_cast<COffloadSurfaceElement*>(item.element.get()) : nullptr) {
             auto original = std::move(wrapped->original);
@@ -666,24 +671,27 @@ static void unwrapOffloadSurfaces(Render::CRenderPass* pass) {
 // Overview flushes its pass before RENDER_LAST_MOMENT, after adjusting child
 // geometry. Intercept actual execution so those edits see ordinary elements.
 // Wrappers are removed before returning; no persistent plugin-owned vtables.
-using FRenderPass = CRegion (*)(Render::CRenderPass*, const CRegion&);
-static CRegion renderOffloadPass(Render::CRenderPass* pass, const CRegion& damage) {
+using FRenderPass = CRegion (*)(Render::CRenderPass*, Render::CRenderContext&, const CRegion&);
+static CRegion renderOffloadPass(Render::CRenderPass* pass, Render::CRenderContext& ctx, const CRegion& damage) {
+    const auto previousContext=g_transferContext;
+    g_transferContext=&ctx;
+    Render::CScopeGuard restoreContext([previousContext] {g_transferContext=previousContext;});
     auto original = reinterpret_cast<FRenderPass>(g_passHook->m_original);
-    const bool main = g_state && g_pHyprRenderer && pass == &g_pHyprRenderer->m_renderPass;
-    if (!main) return original(pass, damage);
-    wrapOffloadSurfaces(true);
-    Render::CScopeGuard restore([pass] { unwrapOffloadSurfaces(pass); });
-    auto result = original(pass, damage);
-    unwrapOffloadSurfaces(pass);
+    const bool main = g_state && g_pHyprRenderer && pass == &ctx.m_pass;
+    if (!main) return original(pass, ctx, damage);
+    wrapOffloadSurfaces(ctx, true);
+    Render::CScopeGuard restore([&ctx, pass] { unwrapOffloadSurfaces(ctx, pass); });
+    auto result = original(pass, ctx, damage);
+    unwrapOffloadSurfaces(ctx, pass);
     for(const auto& item:pass->m_passElements)
         if(!item.discard && item.element)
             if(auto* surface=dynamic_cast<CSurfacePassElement*>(item.element.get()))
-                GpuSwitch::observeRenderedSurface(surface);
+                GpuSwitch::observeRenderedSurface(ctx, surface);
     return result;
 }
 static bool installPassHook() {
     std::vector<SFunctionMatch> matches;
-    for (const auto& match : HyprlandAPI::findFunctionsByName(g_handle, "render"))
+    for (const auto& match : GpuSwitch::findHookFunctions(g_handle, "render"))
         if (match.demangled.find("Render::CRenderPass::render(") != std::string::npos) matches.push_back(match);
     if (matches.size() != 1) return false;
     g_passHook = HyprlandAPI::createFunctionHook(g_handle, matches[0].address, reinterpret_cast<void*>(&renderOffloadPass));
@@ -691,16 +699,16 @@ static bool installPassHook() {
 }
 
 
-bool GpuSwitch::drawTransferredSurface(UP<IPassElement>& original,const CRegion& damage,bool fullscreen) {
+bool GpuSwitch::drawTransferredSurface(Render::CRenderContext& ctx, UP<IPassElement>& original,const CRegion& damage,bool fullscreen) {
     if(!g_state || !g_state->enabled)return false;
     if (!original || !dynamic_cast<CSurfacePassElement*>(original.get())) return false;
     COffloadSurfaceElement wrapper(std::move(original));
     wrapper.fullscreen=fullscreen;
     Render::CScopeGuard restore([&] { original=std::move(wrapper.original); });
-    const auto previous=g_pHyprRenderer->m_renderData.damage;
-    Render::CScopeGuard restoreDamage([&] {g_pHyprRenderer->m_renderData.damage=previous;});
-    g_pHyprRenderer->m_renderData.damage=damage;
-    wrapper.draw();
+    const auto previous=ctx.m_data.damage;
+    Render::CScopeGuard restoreDamage([&] {ctx.m_data.damage=previous;});
+    ctx.m_data.damage=damage;
+    wrapper.draw(ctx);
     return true;
 }
 
@@ -735,7 +743,7 @@ void GpuSwitch::exitClientTransfer() {
     if(!g_state)return;
     stopVramInput();g_state->enabled=false;
     if(g_passHook){g_passHook->unhook();HyprlandAPI::removeFunctionHook(g_handle,g_passHook);g_passHook=nullptr;}
-    unwrapOffloadSurfaces();
+    unwrapOffloadSurfaces(g_pHyprRenderer->context());
     for(auto& entry:g_state->sessions){entry->sourceCommit.reset();entry->sourceDestroy.reset();entry->sourceQueued.reset();}
     g_state->newProducerSurface.reset();g_state->producerWatches.clear();g_state->bufferProducers.clear();
     if(g_state->offloadTimer){g_state->offloadTimer->cancel();g_pEventLoopManager->removeTimer(g_state->offloadTimer);}
@@ -751,7 +759,7 @@ void GpuSwitch::exitClientTransfer() {
 static GpuSwitch::Json transferSessionStatus(const SState::SNV& nv) {
     GpuSwitch::Json result={{"enabled",g_state->enabled},{"ready",nv.client.ready},{"reason",nv.reason},{"worker_reason",nv.client.reason},
         {"transport",nv.client.copyOnly?"gpu-copy":"pq10-convert"},{"worker",static_cast<unsigned long>(nv.client.workerPID)},
-        {"pid",static_cast<unsigned long>(nv.ownerPID)},{"application",nv.identityWindow.lock()?nv.identityWindow.lock()->m_class:""},
+        {"pid",static_cast<unsigned long>(nv.ownerPID)},{"application",nv.identityWindow.lock()?nv.identityWindow.lock()->metadata().appID():""},
         {"source_gpu",nv.sourceGPU?nv.sourceGPU->id:""},{"renderer_gpu",nv.rendererGPU?nv.rendererGPU->id:""},
         {"keep_warm",workerCanStayWarm(nv,nv.owner.lock())},{"eager",nv.eager},{"pipelined_requested",nv.client.pipelined},{"pipelined_active",nv.client.ready && nv.client.pipelinedActive},
         {"prefer_local_input",nv.client.preferLocalInput},{"source_device_local",nv.client.sourceDeviceLocal},

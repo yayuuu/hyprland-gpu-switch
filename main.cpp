@@ -20,7 +20,7 @@
 // Migration runs from a raw Wayland idle callback, outside timer snapshots.
 static HANDLE handle=nullptr;
 static SP<CEventLoopTimer> timer;
-static SP<SHyprCtlCommand> command;
+static SP<IPC::Socket1::SCommand> command;
 static GpuSwitch::Roles roles;
 GpuSwitch::Role GpuSwitch::knownGpuRole(const std::string& pciId) {
     for(const auto& [path,info]:roles)
@@ -142,9 +142,9 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE h) {
             [](int,uint32_t,void*) -> int {drainEvents();lastMigrationError.clear();return 0;},nullptr);
         if(!udevSource) throw std::runtime_error("Cannot register DRM event observer");
         sample();
-        command=HyprlandAPI::registerHyprCtlCommand(handle,SHyprCtlCommand{
-            .name="gpu-switch",.exact=false,.fn=[](eHyprCtlOutputFormat,std::string request) {
-                std::istringstream words(request);std::string name,action;words>>name>>action;
+        command=HyprlandAPI::registerHyprCtlCommand(handle,IPC::Socket1::SCommand{
+            .name="gpu-switch",.match=IPC::Socket1::COMMAND_MATCH_PREFIX,.handler=[](const IPC::Socket1::SRequest& request) -> IPC::Socket1::SResponse {
+                std::istringstream words(request.command);std::string name,action;words>>name>>action;
 #if GPU_SWITCH_DIAGNOSTICS
                 if(action=="bridges")return GpuSwitch::bridgeStatus();
                 if(action=="contexts")return GpuSwitch::transferContextStatus();

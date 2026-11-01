@@ -1,6 +1,10 @@
 [repository]
 name = "hyprland-gpu-switch"
 authors = ["yayuuu"]
+commit_pins = [
+    # Hyprland                                  hyprland-gpu-switch
+    ["efb50993780079460b0cbed1363e2166a2de1d9f", "c088b367fe4180f4812fe8a0e23fced8913ccf96"], # v0.56.2
+]
 
 [hyprland-gpu-switch]
 description = "GPU renderer switching, cross-GPU transport, single-pass HDR and capture pacing."

@@ -1,3 +1,4 @@
+#include "function-hooks.hpp"
 #include "rendering-optimizations.hpp"
 #include "client-transfer.hpp"
 #include <bits/stdc++.h>
@@ -37,7 +38,6 @@
 #include "buffer-compat.hpp"
 #include "drm-route.hpp"
 #include <dlfcn.h>
-#include <cxxabi.h>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
@@ -46,7 +46,7 @@
 using namespace Render;
 using namespace Render::GL;
 using namespace GpuSwitch;
-static_assert(std::string_view(GIT_COMMIT_HASH)=="efb50993780079460b0cbed1363e2166a2de1d9f","Only verified with Hyprland 0.56.2");
+static_assert(std::string_view(GIT_COMMIT_HASH)=="0aa6745f705f2c4b0a5004eb019ef76e5bbdb426","Only verified with Hyprland 0.57.0");
 static HANDLE pluginHandle=nullptr;
 static std::vector<CFunctionHook*> hooks;
 static std::map<ITexture*,WP<ITexture>> textures;
@@ -149,7 +149,7 @@ static CFunctionHook* unloadHook=nullptr;
 static void unloadPlugin(CPluginSystem* system,const CPlugin* plugin,bool eject) {
     if(plugin && plugin->m_handle==pluginHandle && activeRoutes && g_pCompositor && !g_pCompositor->m_isShuttingDown) {
         readiness="cannot unload while migrated GPU resources are live; disable automatic switching instead";
-        Log::logger->log(Log::ERR,"[gpu-switch] {}",readiness);
+        LOG(Log::ERR,"[gpu-switch] {}",readiness);
         return;
     }
     reinterpret_cast<void(*)(CPluginSystem*,const CPlugin*,bool)>(unloadHook->m_original)(system,plugin,eject);
@@ -167,13 +167,13 @@ static void onSyncFired(Monitor::CMonitorFrameScheduler* self) {
     if(pausedSince) {self->m_renderAtFrame=true;return;}
     reinterpret_cast<void(*)(Monitor::CMonitorFrameScheduler*)>(syncFiredHook->m_original)(self);
 }
-static bool pendingCommit(void* self,PHLMONITOR monitor) {
+static bool pendingCommit(void* self,PHLMONITOR monitor,std::optional<Monitor::CDamageRing::CTransaction> damage,const CRegion& renderedDamage) {
     if(pausedSince)return false;
     if(activeRoutes && monitor) {
         try {activeRoutes->beforeCommit(monitor.get());}
         catch(const std::exception& error) {readiness=error.what();return false;}
     }
-    return reinterpret_cast<bool(*)(void*,PHLMONITOR)>(pendingCommitHook->m_original)(self,monitor);
+    return reinterpret_cast<bool(*)(void*,PHLMONITOR,std::optional<Monitor::CDamageRing::CTransaction>,const CRegion&)>(pendingCommitHook->m_original)(self,monitor,std::move(damage),renderedDamage);
 }
 void GpuSwitch::cancelMigration() {
     if(!pausedSince)return;
@@ -320,13 +320,7 @@ static WP<CShader> useShader(void* self,WP<CShader> shader) {
 }
 static CFunctionHook* install(const std::string& name,const std::string& prefix,const std::string& token,void* replacement) {
     std::vector<SFunctionMatch> matches;
-    for (auto match:HyprlandAPI::findFunctionsByName(pluginHandle,name)) {
-        // The runtime API's separately cached nm lists can be misaligned. Bind
-        // the checked signature to the exact same mangled symbol/address.
-        int status=0;
-        std::unique_ptr<char,decltype(&std::free)> demangled(abi::__cxa_demangle(match.signature.c_str(),nullptr,nullptr,&status),&std::free);
-        if(status!=0 || !demangled)continue;
-        match.demangled=demangled.get();
+    for (auto match:GpuSwitch::findHookFunctions(pluginHandle,name)) {
         if(match.demangled.starts_with(prefix) && match.demangled.contains(token))matches.push_back(std::move(match));
     }
     if(matches.size()!=1) throw std::runtime_error("Ambiguous or missing GPU migration hook: "+prefix+token);
@@ -352,7 +346,8 @@ static void collect() {
         track(mon->m_splash);track(mon->m_background);
         if(auto r=mon->m_resources.get()) {
             track(r->m_mirrorTex);track(r->m_stencilTex);track(r->m_blurFB);track(r->m_monitorMirrorFB);
-            for(auto& b:r->m_workBuffers) track(b.buffer);
+            for(auto& b:r->m_workBuffers.m_resources) track(b.buffer);
+            for(auto& b:r->m_sizedWorkBuffers.m_resources) track(b.buffer);
         }
     }
     for(auto& [mon,fb]:gl->m_monitorBGFBs) track(fb);
@@ -512,7 +507,7 @@ std::string GpuSwitch::migrate(const std::string& id,const std::function<bool()>
         HANDLE handle;
         explicit TransferReset(HANDLE h):handle(h){GpuSwitch::exitRenderingOptimizations();GpuSwitch::exitClientTransfer();}
         ~TransferReset(){try{GpuSwitch::initClientTransfer(handle);GpuSwitch::initRenderingOptimizations(handle);}catch(const std::exception& e){
-            GpuSwitch::exitRenderingOptimizations();GpuSwitch::exitClientTransfer();Log::logger->log(Log::ERR,"[gpu-switch] Cannot restore client transport: {}",e.what());}}
+            GpuSwitch::exitRenderingOptimizations();GpuSwitch::exitClientTransfer();LOG(Log::ERR,"[gpu-switch] Cannot restore client transport: {}",e.what());}}
     } transferReset(pluginHandle);
     // Release extension-owned rendering resources through the compositor lifecycle.
     struct PluginReset {
@@ -522,7 +517,7 @@ std::string GpuSwitch::migrate(const std::string& id,const std::function<bool()>
         PluginReset(HANDLE ownHandle) {
             for(const auto& plugin:g_pPluginSystem->getAllPlugins())
                 if(plugin->m_handle!=ownHandle)entries.push_back({plugin->m_path,plugin->m_loadedWithConfig});
-            g_pHyprRenderer->m_renderPass.clear();
+            g_pHyprRenderer->context().m_pass.clear();
             for(const auto& entry:entries) {
                 // Timer/idle callback destructors may still carry function manager
                 // pointers into a peer DSO. Keep code mapped across its lifecycle.
@@ -539,10 +534,10 @@ std::string GpuSwitch::migrate(const std::string& id,const std::function<bool()>
             for(const auto& entry:entries) {
                 try {
                     g_pPluginSystem->loadPlugin(entry.path,SPECIAL_PID_TYPE_CONFIG)->then([entry](SP<CPromiseResult<CPlugin*>> result) {
-                        if(result->hasError())Log::logger->log(Log::ERR,"[gpu-switch] Cannot restore plugin {}: {}",entry.path,result->error());
+                        if(result->hasError())LOG(Log::ERR,"[gpu-switch] Cannot restore plugin {}: {}",entry.path,result->error());
                         else result->result()->m_loadedWithConfig=entry.configured;
                     });
-                } catch(const std::exception& e) {Log::logger->log(Log::ERR,"[gpu-switch] Cannot restore plugin {}: {}",entry.path,e.what());}
+                } catch(const std::exception& e) {LOG(Log::ERR,"[gpu-switch] Cannot restore plugin {}: {}",entry.path,e.what());}
             }
         }
         ~PluginReset(){resume();}
@@ -569,9 +564,8 @@ std::string GpuSwitch::migrate(const std::string& id,const std::function<bool()>
         Native::waitIdle();
         // Cached output renderbuffers are disposable. Rebuild on next frame in the
         // new context; KMS/Aquamarine keep the currently scanned-out buffers alive.
-        auto renderer=dynamic_cast<CHyprGLRenderer*>(g_pHyprRenderer.get());
-        renderer->m_currentRenderbuffer.reset();g_pHyprRenderer->m_renderbuffers.clear();
-        g_pHyprRenderer->m_renderData.currentFB.reset();g_pHyprRenderer->m_renderData.mainFB.reset();g_pHyprRenderer->m_renderData.outFB.reset();
+        g_pHyprRenderer->context().m_currentRenderbuffer.reset();g_pHyprRenderer->m_renderbuffers.clear();
+        g_pHyprRenderer->context().m_data.currentFB.reset();g_pHyprRenderer->context().m_data.mainFB.reset();g_pHyprRenderer->context().m_data.outFB.reset();
         collect();
         Diagnostics::trace("prepare-drm-routes");
         routes=std::make_unique<DrmRoutes>(id);

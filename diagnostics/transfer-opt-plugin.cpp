@@ -19,7 +19,7 @@ static void removeTransferHook() {
  if(trampoline)munmap(trampoline,4096);
  entry=nullptr;trampoline=nullptr;
 }
-static SP<SHyprCtlCommand> command;
+static SP<IPC::Socket1::SCommand> command;
 static bool enabled=true;
 static GpuSwitch::TransferStats stats;
 static Aquamarine::CDRMRenderer::SBlitResult blit(Aquamarine::CDRMRenderer* renderer,SP<Aquamarine::IBuffer> from,SP<Aquamarine::IBuffer> to,SP<Aquamarine::CDRMRenderer> source,int fd) {
@@ -42,7 +42,8 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE h) {
  entry=address;memcpy(saved.data(),entry,14);
  if(!protectEntry(PROT_READ|PROT_WRITE|PROT_EXEC)){munmap(trampoline,4096);entry=nullptr;trampoline=nullptr;throw std::runtime_error("Cannot patch transfer entry");}
  writeJump(entry,reinterpret_cast<void*>(&blit));protectEntry(PROT_READ|PROT_EXEC);
- command=HyprlandAPI::registerHyprCtlCommand(owner,SHyprCtlCommand{.name="gpu-transfer-opt",.exact=false,.fn=[](eHyprCtlOutputFormat,std::string request){
+ command=HyprlandAPI::registerHyprCtlCommand(owner,IPC::Socket1::SCommand{.name="gpu-transfer-opt",.match=IPC::Socket1::COMMAND_MATCH_PREFIX,.handler=[](const IPC::Socket1::SRequest& ipcRequest) -> IPC::Socket1::SResponse {
+ const auto& request=ipcRequest.command;
  if(request.ends_with(" disable"))enabled=false;
  if(request.ends_with(" enable"))enabled=true;
  if(request.ends_with(" reset"))stats={};

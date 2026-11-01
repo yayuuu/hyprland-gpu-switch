@@ -7,7 +7,7 @@ std::string clientTransferStatus();
 }
 
 namespace Aquamarine { struct SDMABUFAttrs; }
-namespace Render { class ITexture; namespace GL { class CGLTexture; } }
+namespace Render { class CRenderContext; class ITexture; namespace GL { class CGLTexture; } }
 namespace GpuSwitch {
 using TransferTextureFactory=Hyprutils::Memory::CSharedPointer<Render::ITexture> (*)(void*,const Aquamarine::SDMABUFAttrs&,bool);
 using TransferTextureBind=void (*)(Render::GL::CGLTexture*);
@@ -17,5 +17,5 @@ bool bindClientTransferTexture(Render::GL::CGLTexture*,TransferTextureBind);
 
 class IPassElement;
 namespace GpuSwitch {
-bool drawTransferredSurface(Hyprutils::Memory::CUniquePointer<IPassElement>&,const CRegion&,bool fullscreen);
+bool drawTransferredSurface(Render::CRenderContext& ctx, Hyprutils::Memory::CUniquePointer<IPassElement>&,const CRegion&,bool fullscreen);
 }
