@@ -173,3 +173,27 @@ The optional `gl-cache-repair.so` diagnostic target requires `DIAGNOSTICS=1`.
 It reports cached versus actual blend factors through `hyprctl gpu-gl-cache`;
 `hyprctl gpu-gl-cache repair` performs a one-shot cache synchronization at the
 next render begin. It does not replace the migration plugin or its resources.
+
+### Output wake diagnostics
+
+Build the separate passive probe with make DIAGNOSTICS=1 .build/diagnostics/output-wake-probe.so.
+It observes DPMS signals and forwards monitor commits unchanged, reporting
+CPU-side output state through hyprctl --batch 'wakeprobe status'.
+It retains up to 256 control/failure events without holding monitors alive.
+diagnostics/output-wake-watch.py --snapshot writes a manual report;
+--watch records transitions, post-wake snapshots and persistent internal-panel
+backlight mismatches. Kernel CRTC reads are isolated, bounded to 3 seconds,
+and limited to Intel. The default build does not include or load this probe.
+
+### Secondary output wake regression
+
+DPMS can release a secondary backend's renderer and allocator while its routing
+entry remains alive. Before preparing an enabled output, restore the backend
+resources and replace scanout chains whose allocator belongs to the previous
+resource generation. A disabled output must not trigger this restoration.
+
+Build and run .build/release/route-resources-test. It covers repeated resource
+release, backend recreation by another output, and failed initialization followed
+by retry. Hardware validation requires a new session with the rebuilt plugin,
+followed by several DPMS off/on cycles on both outputs. The passive wake probe
+records commit results and kernel output state for investigating any recurrence.

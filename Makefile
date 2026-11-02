@@ -186,3 +186,10 @@ $(BUILD_DIR)/retained-source-test: tests/retained-source-test.cpp transfer/retai
 retained-source-check: $(BUILD_DIR)/retained-source-test
 	./$(BUILD_DIR)/retained-source-test
 check: retained-source-check
+
+$(BUILD_DIR)/output-wake-probe.so: diagnostics/output-wake-probe.cpp json.hpp Makefile | require-diagnostics check-deps $(BUILD_DIR)
+	$(CXX) $(COMPILE_FLAGS) -shared -fPIC -fno-gnu-unique $(PACKAGE_CFLAGS) $< -o $@.new
+	mv $@.new $@
+
+$(BUILD_DIR)/route-resources-test: tests/route-resources-test.cpp route-resources.hpp | $(BUILD_DIR)
+	$(CXX) $(COMPILE_FLAGS) -I. $< -o $@

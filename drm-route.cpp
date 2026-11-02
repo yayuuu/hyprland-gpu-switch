@@ -16,6 +16,7 @@
 #include "buffer-compat.hpp"
 #include "route-plan.hpp"
 #include "route-lifetime.hpp"
+#include "route-resources.hpp"
 #include "native.hpp"
 #include "probe.hpp"
 #include <sys/stat.h>
@@ -148,6 +149,10 @@ void DrmRoutes::update(Monitor::CMonitor* monitor) {
     auto& s=*state_;
     if(!s.active || !monitor || !monitor->m_output || !monitor->m_enabled)return;
     retireDisconnected();
+    // Disabling an output must not resurrect an idle secondary GPU. Aquamarine
+    // may release its allocator and renderer after the last output goes dark.
+    if(!monitor->m_output->state->state().enabled)return;
+    Native::CurrentGuard restore;
     auto it=std::ranges::find_if(s.outputs,[&](const auto& o){return o.monitor.get()==monitor;});
     if(it==s.outputs.end()) {
         auto backend=dynamicPointerCast<CDRMBackend>(monitor->m_output->getBackend());
@@ -159,9 +164,31 @@ void DrmRoutes::update(Monitor::CMonitor* monitor) {
         s.outputs.push_back(std::move(o));return;
     }
     if(!it->scanout) {checkScanout(monitor->m_output->swapchain,monitor->m_output);return;}
+    auto backend=it->backend;
+    restoreRouteResources(
+        [&]{return bool(backend->rendererState.renderer) && bool(backend->rendererState.allocator);},
+        [&]{
+            if(!backend->initMgpu() || !backend->rendererState.renderer || !backend->rendererState.allocator)
+                throw std::runtime_error("Cannot restore output transfer resources after DPMS");
+        },
+        [&]{
+            recoverTransferRenderer(g_pCompositor->m_aqBackend,backend->gpu->renderNodeFd>=0?backend->gpu->renderNodeFd:backend->gpu->fd,backend->rendererState.renderer);
+        },
+        [&]{return it->scanout->getAllocator()==backend->rendererState.allocator;},
+        [&]{
+            // Never reuse a scanout chain from an allocator retired by DPMS.
+            // Publish the replacement only after allocation and format checks.
+            auto replacement=CSwapchain::create(backend->rendererState.allocator,backend);
+            auto options=monitor->m_output->swapchain->currentOptions();
+            options.scanout=true;options.multigpu=false;options.scanoutOutput=monitor->m_output;
+            if(!replacement || !replacement->reconfigure(options))
+                throw std::runtime_error("Cannot restore scanout buffers after DPMS");
+            checkScanout(replacement,monitor->m_output);
+            it->scanout=std::move(replacement);
+        });
     auto options=monitor->m_output->swapchain->currentOptions();options.scanout=true;options.multigpu=false;options.scanoutOutput=monitor->m_output;
     if(!it->scanout->reconfigure(options))throw std::runtime_error("Cannot resize scanout copy buffers");
-    checkScanout(it->scanout,monitor->m_output);prepareCopy(monitor->m_output->swapchain,it->backend);
+    checkScanout(it->scanout,monitor->m_output);prepareCopy(monitor->m_output->swapchain,backend);
     monitor->m_output->swapchain->options.multigpu=false;
     it->output->mgpu.swapchain=it->scanout;
 }
