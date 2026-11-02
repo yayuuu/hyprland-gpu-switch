@@ -30,7 +30,7 @@ Other supported buffers use native-format copying. Already-PQ content is not con
 - Validates format, modifier, layout and GPU identity. Unknown or ambiguous provenance and unsupported transformations use the ordinary rendering path.
 - Uses native fences for source acquisition, conversion completion, compositor sampling and output-slot reuse. Source buffers remain retained until the GPU has finished reading them.
 - Starts preprocessing on source commits when possible, reuses three output slots and reserves capacity across ordinary window resizes. Where supported, row-band pipelining overlaps transfer and conversion; other queue configurations use the serial GPU path.
-- Preserves specialized device-local input handling for confirmed NVIDIA producers without applying it to buffers from unrelated drivers.
+- Preserves specialized device-local input handling for confirmed NVIDIA producers across supported SDR and HDR formats, including alpha, without applying it to buffers from unrelated drivers.
 - Starts helpers on demand and keeps them ready across workspace changes without copying inactive content. Stops helpers when their windows close or the relevant GPU is no longer needed, after outstanding work has drained. Before renderer migration, worker submissions and transport resources are drained; imports and tracking are recreated for the resulting renderer, including rollback.
 
 ### Scope and limitations

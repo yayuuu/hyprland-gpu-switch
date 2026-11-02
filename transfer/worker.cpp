@@ -433,7 +433,7 @@ class Worker {
         VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};submit.waitSemaphoreCount=slot.waits.size();submit.pWaitSemaphores=slot.waits.data();submit.pWaitDstStageMask=stages.data();submit.commandBufferCount=1;submit.pCommandBuffers=&slot.download;submit.signalSemaphoreCount=1;submit.pSignalSemaphores=&slot.complete;
         vkcheck(vkQueueSubmit(copyQueue,1,&submit,slot.fence),"submit native-format transport");slot.initialized=true;
         VkSemaphoreGetFdInfoKHR get{VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR};get.semaphore=slot.complete;get.handleType=VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT;int completion=-1;vkcheck(getSemaphoreFd(device,&get,&completion),"export transport completion");FD complete(completion);
-        Packet result{};result.type=RESULT;result.serial=job.serial;result.slot=job.slot;result.width=job.width;result.height=job.height;result.format=job.format;result.stride=slot.image->stride;result.offset=slot.image->offset;result.fdFlags=COPY_ONLY;
+        Packet result{};result.type=RESULT;result.serial=job.serial;result.slot=job.slot;result.width=job.width;result.height=job.height;result.format=job.format;result.stride=slot.image->stride;result.offset=slot.image->offset;result.fdFlags=COPY_ONLY;if(input.deviceLocal)result.fdFlags|=SOURCE_DEVICE_LOCAL;
         std::vector<int> output{slot.image->fd.value};if(complete.value>=0){result.fdFlags|=COMPLETE;output.push_back(complete.value);}
         if(!send(sock,result,output))throw std::runtime_error("Cannot send native-format transport result");
     }

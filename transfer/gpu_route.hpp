@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <fstream>
 #include <optional>
+#include <map>
 #include <set>
 #include <string>
 #include <vector>
@@ -37,6 +38,27 @@ inline std::optional<GPUDevice> selectProducer(const std::string& exporter, cons
     std::erase_if(matches,[&](const auto& device){return !clientDevices.contains(device.id);});
     return matches.size()==1?std::optional(matches.front()):std::nullopt;
 }
+// Failed client-FD scans are expensive and cannot identify a producer. Back
+// off only those failures; positive identities are revalidated on every scan.
+// Exporter and fresh acquire-fence evidence is checked before this fallback.
+class ClientProducerProbe {
+    std::map<pid_t,std::chrono::steady_clock::time_point> retryAfter;
+  public:
+    template<class Scan> std::optional<GPUDevice> select(const std::string& exporter,const std::vector<GPUDevice>& devices,
+        pid_t pid,std::chrono::steady_clock::time_point now,Scan scan) {
+        if(pid<=0)return std::nullopt;
+        if(auto previous=retryAfter.find(pid);previous!=retryAfter.end() && now<previous->second)return std::nullopt;
+        auto result=selectProducer(exporter,devices,scan(pid));
+        if(result){retryAfter.erase(pid);return result;}
+        if(retryAfter.size()>=128) {
+            std::erase_if(retryAfter,[&](const auto& entry){return entry.second<=now;});
+            if(retryAfter.size()>=128)retryAfter.erase(retryAfter.begin());
+        }
+        retryAfter[pid]=now+std::chrono::milliseconds(100);
+        return std::nullopt;
+    }
+};
+
 inline std::optional<GPUDevice> fenceProducer(int fd,const std::vector<GPUDevice>& devices) {
     if(fd<0)return std::nullopt;
     sync_file_info info{};if(ioctl(fd,SYNC_IOC_FILE_INFO,&info) || !info.num_fences || info.num_fences>64)return std::nullopt;
@@ -98,18 +120,22 @@ inline std::optional<GPUDevice> producerDevice(int fd, pid_t clientPID, int acqu
     if(exporter.empty())return std::nullopt;
     // Disambiguate multiple GPUs using the same exporter only when the actual
     // Wayland client has DRM descriptors for exactly one matching device.
-    std::set<std::string> ids;std::error_code error;
-    if(clientPID>0)for(const auto& entry:std::filesystem::directory_iterator("/proc/"+std::to_string(clientPID)+"/fdinfo",error)) {
-        struct stat st{};
-        const auto fdPath=std::filesystem::path("/proc")/std::to_string(clientPID)/"fd"/entry.path().filename();
-        if(!stat(fdPath.c_str(),&st) && S_ISCHR(st.st_mode)) {
+    static ClientProducerProbe clientProbe;
+    return clientProbe.select(exporter,gpuDevices(),clientPID,std::chrono::steady_clock::now(),[](pid_t pid) {
+        std::set<std::string> ids;std::error_code error;
+        for(const auto& entry:std::filesystem::directory_iterator("/proc/"+std::to_string(pid)+"/fdinfo",error)) {
+            struct stat st{};
+            const auto fdPath=std::filesystem::path("/proc")/std::to_string(pid)/"fd"/entry.path().filename();
+            // DRM descriptors are character devices. Do not open fdinfo for
+            // every game file, eventfd, socket and anonymous mapping.
+            if(stat(fdPath.c_str(),&st) || !S_ISCHR(st.st_mode))continue;
             const auto id=deviceID(st.st_rdev);if(!id.empty())ids.insert(id);
+            std::ifstream stream(entry.path());
+            for(std::string line;std::getline(stream,line);)if(line.starts_with("drm-pdev:")) {
+                auto pos=line.find_first_not_of(" \t",9);if(pos!=std::string::npos)ids.insert(line.substr(pos));
+            }
         }
-        std::ifstream stream(entry.path());
-        for(std::string line;std::getline(stream,line);)if(line.starts_with("drm-pdev:")) {
-            auto pos=line.find_first_not_of(" \t",9);if(pos!=std::string::npos)ids.insert(line.substr(pos));
-        }
-    }
-    return selectProducer(exporter,gpuDevices(),ids);
+        return ids;
+    });
 }
 }

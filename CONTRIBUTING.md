@@ -138,7 +138,11 @@ make gpu-transfer-test
 .build/release/cross-gpu-worker-test .build/release/gpu-transfer-worker /dev/dri/renderD129 /dev/dri/renderD128
 ```
 
-Append `copy`, `copy-tiled`, `copy8`, `copy8-tiled` or `copy10-tiled` to test native-format transport. Append `pq-native` to create an optimal, device-local FP16 source and verify the native VRAM-to-PQ path, including the device-local import flag, completion fence and output pixels. Tiled cases require a source GPU supporting the requested modifier. Tests create offscreen buffers only and verify fences, color/alpha values and GL state restoration. They do not connect to Wayland or perform renderer migration.
+Append `copy`, `copy-tiled`, `copy8`, `copy8-tiled` or `copy10-tiled` to test native-format transport. Append `pq-native` to create an optimal, device-local FP16 source and verify the native VRAM-to-PQ path, including the device-local import flag, completion fence and output pixels. `copy8-native`, `copy10-native` and `copy-native` cover native VRAM copies with preserved RGBA8, RGB10/A2 and FP16 alpha. Tiled cases require a source GPU supporting the requested modifier. Tests create offscreen buffers only and verify fences, color/alpha values and GL state restoration. They do not connect to Wayland or perform renderer migration.
+
+Failed producer identification backs off client descriptor scans for 100 ms and only reads character-device fdinfo. Positive client-device identities are revalidated, and fresh acquire-fence/exporter evidence is still checked on every attempt. Unknown and ambiguous producers retain the standard compositor path.
+
+Native-format `gpu-copy` jobs skip compositor color-conversion setup; their source image description is retained and Hyprland still performs ordinary composition color management. External-only output sampling is performed once per submitted frame and repeated draws retain the materialized texture. New submissions and renderer resource recreation invalidate that reuse; completion and read fences remain in place. The native-format GPU tests use invalid conversion uniforms to verify that copying ignores them and preserves pixels.
 
 `make check` also tests producer provenance and borrowing unique-owned queued states without converting weak pointers to shared ownership. `hyprctl gpu-switch transfers` retains operational status in release builds and adds frame counters in diagnostic builds. Detailed worker output is compiled out by default.
 

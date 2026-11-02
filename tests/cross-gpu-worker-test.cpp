@@ -10,6 +10,7 @@
 #include <GLES2/gl2ext.h>
 #include <vulkan/vulkan.h>
 #include <cmath>
+#include <limits>
 #include <iostream>
 #include <fcntl.h>
 #include <poll.h>
@@ -57,12 +58,13 @@ struct Source {
         VkExportMemoryAllocateInfo exportInfo{VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO};exportInfo.handleTypes=VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
         VkMemoryDedicatedAllocateInfo dedicated{VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO};dedicated.image=image;dedicated.pNext=&exportInfo;
         VkMemoryAllocateInfo alloc{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};alloc.pNext=&dedicated;alloc.allocationSize=req.size;alloc.memoryTypeIndex=type;check(vkAllocateMemory(device,&alloc,nullptr,&memory),"source memory");check(vkBindImageMemory(device,image,memory,0),"bind source");
-        if(native) {layout.offset=0;layout.rowPitch=64*8;}
+        if(native) {layout.offset=0;layout.rowPitch=64*transportFormat(format)->bytes;}
         else {VkImageSubresource sub{VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT,0,0};vkGetImageSubresourceLayout(device,image,&sub,&layout);}
         VkCommandPoolCreateInfo pi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};pi.queueFamilyIndex=family;check(vkCreateCommandPool(device,&pi,nullptr,&pool),"pool");VkCommandBufferAllocateInfo ca{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};ca.commandPool=pool;ca.level=VK_COMMAND_BUFFER_LEVEL_PRIMARY;ca.commandBufferCount=1;check(vkAllocateCommandBuffers(device,&ca,&command),"commands");
         transition(false);
         check(vkResetCommandPool(device,pool,0),"reset clear pool");VkCommandBufferBeginInfo clearBegin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};check(vkBeginCommandBuffer(command,&clearBegin),"begin clear");
-        VkClearColorValue clear{};clear.float32[0]=.25f;clear.float32[1]=.5f;clear.float32[2]=1;clear.float32[3]=alpha?.5f:1;
+        VkClearColorValue clear{};clear.float32[0]=.25f;clear.float32[1]=.5f;clear.float32[2]=1;// Use a representable A2 value; 0.5 lies exactly between two quantization levels.
+        clear.float32[3]=alpha?(format==DRM_FORMAT_ABGR2101010?2.F/3.F:.5F):1.F;
         VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};vkCmdClearColorImage(command,image,VK_IMAGE_LAYOUT_GENERAL,&clear,1,&range);check(vkEndCommandBuffer(command),"end clear");VkSubmitInfo clearSubmit{VK_STRUCTURE_TYPE_SUBMIT_INFO};clearSubmit.commandBufferCount=1;clearSubmit.pCommandBuffers=&command;check(vkQueueSubmit(queue,1,&clearSubmit,VK_NULL_HANDLE),"clear source");check(vkQueueWaitIdle(queue),"clear complete");
         transition(true);
         VkMemoryGetFdInfoKHR get{VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR};get.memory=memory;get.handleType=VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
@@ -114,11 +116,11 @@ struct Child {
     ~Child(){socket.reset();if(pid>0){int status;while(waitpid(pid,&status,0)<0 && errno==EINTR){}}}
 };
 int main(int argc,char** argv){
-    if(argc!=4 && argc!=5){std::cerr<<"usage: cross-gpu-worker-test WORKER SOURCE_RENDER_NODE TARGET_RENDER_NODE [copy|copy-tiled|pq-native]\n";return 2;}
+    if(argc!=4 && argc!=5){std::cerr<<"usage: cross-gpu-worker-test WORKER SOURCE_RENDER_NODE TARGET_RENDER_NODE [copy|copy-tiled|pq-native|copy8-native|copy10-native]\n";return 2;}
     try {
         auto all=gpuDevices();auto found=std::ranges::find_if(all,[&](const auto& d){return d.node==argv[2];});if(found==all.end())throw std::runtime_error("Unknown source node");auto gpu=*found;
-        const bool native=argc==5 && std::string(argv[4])=="pq-native";
-        const bool copyOnly=argc==5 && !native;const bool tiled=copyOnly && std::string(argv[4]).find("tiled")!=std::string::npos;
+        const bool native=argc==5 && std::string(argv[4]).ends_with("-native");
+        const bool copyOnly=argc==5 && std::string(argv[4]).starts_with("copy");const bool tiled=copyOnly && std::string(argv[4]).find("tiled")!=std::string::npos;
         const bool eight=copyOnly && std::string(argv[4]).starts_with("copy8");
         const bool ten=copyOnly && std::string(argv[4]).starts_with("copy10");
         const uint32_t pixelFormat=eight?DRM_FORMAT_ABGR8888:ten?DRM_FORMAT_ABGR2101010:DRM_FORMAT_ABGR16161616F;
@@ -135,6 +137,8 @@ int main(int argc,char** argv){
         Child child(argv[1]);Packet hello;hello.type=HELLO;if(native)hello.fdFlags|=PREFER_LOCAL_INPUT|PIPELINED;hello.width=64;hello.height=32;if(copyOnly)hello.fdFlags|=COPY_ONLY;hello.format=pixelFormat;hello.gpuMajor=gpu.renderMajor;hello.gpuMinor=gpu.renderMinor;hello.gpuPCI=gpu.pci;send(child.socket.value,hello);std::vector<FD> fds;auto ready=child.receive(fds);if(ready.type!=READY)throw std::runtime_error("Not ready");
         Packet job;job.type=CONVERT;job.width=64;job.height=32;job.format=pixelFormat;job.stride=source.layout.rowPitch;job.offset=source.layout.offset;job.source=1;job.serial=1;job.modifier=source.modifier;if(copyOnly)job.fdFlags|=COPY_ONLY;job.color[0]=job.color[5]=job.color[10]=job.color[13]=job.color[15]=1;
         std::vector<int> inputs{source.fd.value};if(source.acquire.value>=0){job.fdFlags|=ACQUIRE;inputs.push_back(source.acquire.value);}
+        // Native copies must ignore conversion uniforms and preserve all channels.
+        if(copyOnly)job.color.fill(std::numeric_limits<float>::quiet_NaN());
         if(native)job.fdFlags|=NATIVE_INPUT;
         send(child.socket.value,job,inputs);auto output=child.receive(fds);if(native && !(output.fdFlags&SOURCE_DEVICE_LOCAL))throw std::runtime_error("Native source was not imported in device-local memory");if(output.type!=RESULT || fds.empty())throw std::runtime_error("Invalid result");
         if(output.fdFlags&COMPLETE){pollfd p{fds.at(1).value,POLLIN,0};if(poll(&p,1,10000)<=0)throw std::runtime_error("Conversion fence timeout");}
@@ -153,7 +157,7 @@ int main(int argc,char** argv){
             for(unsigned i=0;i<64*32;++i)for(unsigned c=0;c<4;++c)if(std::abs(int(pixels[i*4+c])-std::array<int,4>{64,128,255,128}[c])>1)throw std::runtime_error("RGBA8 transport altered color or alpha");
         }else if(ten) {
             std::vector<uint32_t> pixels(64*32);glReadPixels(0,0,64,32,GL_RGBA,GL_UNSIGNED_INT_2_10_10_10_REV,pixels.data());if(glGetError()!=GL_NO_ERROR)throw std::runtime_error("RGB10 output readback failed");
-            for(auto pixel:pixels){for(unsigned c=0;c<3;++c)if(std::abs(int((pixel>>(10*c))&1023)-std::array<int,3>{256,512,1023}[c])>1)throw std::runtime_error("RGB10 transport altered color");if((pixel>>30)!=2)throw std::runtime_error("RGB10 transport altered alpha");}
+            for(auto pixel:pixels){for(unsigned c=0;c<3;++c)if(std::abs(int((pixel>>(10*c))&1023)-std::array<int,3>{256,512,1023}[c])>1)throw std::runtime_error("RGB10 transport altered color");if((pixel>>30)!=2)throw std::runtime_error("RGB10 transport altered alpha: "+std::to_string(pixel>>30));}
         }else if(copyOnly) {
             std::vector<float> pixels(64*32*4);glReadPixels(0,0,64,32,GL_RGBA,GL_FLOAT,pixels.data());if(glGetError()!=GL_NO_ERROR)throw std::runtime_error("FP16 output readback failed");
             for(unsigned i=0;i<64*32;++i)for(unsigned c=0;c<4;++c)if(std::abs(pixels[i*4+c]-std::array<float,4>{.25f,.5f,1.f,.5f}[c])>0.000001f)throw std::runtime_error("FP16 transport altered color or alpha");

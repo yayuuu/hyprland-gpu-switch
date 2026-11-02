@@ -49,7 +49,7 @@ static void vramBufferConstructor(void* object, uint32_t id, wl_client* client, 
 
 static SP<Render::ITexture> vramCreateTexture(void* renderer, const Aquamarine::SDMABUFAttrs& attrs, bool opaque) {
     if (!g_vramConstructing || !g_state || attrs.planes != 1 || attrs.modifier != DRM_FORMAT_MOD_LINEAR ||
-        (attrs.format != DRM_FORMAT_XBGR16161616F && attrs.format != DRM_FORMAT_ABGR16161616F)) {
+        !Offload::transportFormat(attrs.format)) {
         return g_vramCreateOriginal(renderer, attrs, opaque);
     }
     // Query mapping compatibility on the NVIDIA worker before touching EGL.
@@ -65,7 +65,8 @@ static SP<Render::ITexture> vramCreateTexture(void* renderer, const Aquamarine::
     proxy->m_size = attrs.size;
     proxy->m_drmFormat = attrs.format;
     proxy->m_isSynchronous = false;
-    proxy->m_type = Render::TEXTURE_RGBX;
+    proxy->m_opaque = opaque;
+    proxy->m_type = opaque ? Render::TEXTURE_RGBX : Render::TEXTURE_RGBA;
     std::erase_if(g_state->vram.proxies, [](const auto& item) { return item.second.texture.expired(); });
     // Native image layout is selected explicitly for this producer. Padding
     // in its advertised row pitch does not turn an optimal image into linear.
@@ -106,7 +107,7 @@ static void vramBind(Render::GL::CGLTexture* texture) {
     auto safe = currentNV().cachedSlot?currentNV().slots[*currentNV().cachedSlot].texture:SP<Render::ITexture>{};
     if (safe && safe->ok()) {
         auto& rd = transferContext().m_data;
-        if (surface && monitor && rd.currentFB && surface->m_colorManagement.valid()) {
+        if (!currentNV().client.copyOnly && surface && monitor && rd.currentFB && surface->m_colorManagement.valid()) {
             const auto source = NColorManagement::CImageDescription::from(surface->m_colorManagement->imageDescription());
             const auto target = rd.currentFB->imageDescription();
             if (target && source) {
@@ -209,7 +210,7 @@ static bool setVramInput(bool enable, bool native = false) {
         // Keep protecting already-created source textures until they retire.
         return true;
     }
-    if(currentNV().client.copyOnly || !currentNV().sourceGPU || Offload::exporterDriver(currentNV().sourceGPU->driver)!="nvidia")
+    if(!currentNV().sourceGPU || Offload::exporterDriver(currentNV().sourceGPU->driver)!="nvidia")
         { g_vramError="native NVIDIA input requires a confirmed NVIDIA producer";return false; }
     if (!g_state->enabled || !currentNV().enabled || !currentNV().client.ready || !currentNV().flag ||
         currentNV().sourceSurface.expired() || !PROTO::linuxDma)
@@ -245,7 +246,7 @@ static bool setVramInput(bool enable, bool native = false) {
 // materialized frame. This never creates an NVIDIA context on the desktop.
 static void updateAutomaticVramInput() {
     if (!g_state || !g_state->vram.automatic || !g_state->enabled || !currentNV().enabled) return;
-    if(currentNV().client.copyOnly || !currentNV().sourceGPU || Offload::exporterDriver(currentNV().sourceGPU->driver)!="nvidia")return;
+    if(!currentNV().sourceGPU || Offload::exporterDriver(currentNV().sourceGPU->driver)!="nvidia")return;
     if(g_state->vram.session && g_state->vram.session!=&currentNV())return;
     auto& state = g_state->vram;
     const auto& nv = currentNV();

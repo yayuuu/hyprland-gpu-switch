@@ -95,6 +95,7 @@ struct SState {
         Offload::FD outputFD, conversionComplete;
         uint32_t width = 0, height = 0, stride = 0, offset = 0, format = DRM_FORMAT_XBGR2101010;
         bool awaitingFence = false;
+        bool materializationPending = true;
     };
     struct SNV {
         WP<CWLSurfaceResource> identitySurface;
@@ -114,6 +115,9 @@ struct SState {
         uint64_t eagerFrames = 0;
         unsigned nextSlot = 0;
         uint64_t frames = 0, reused = 0, windowFrames = 0, captureFrames = 0;
+#if GPU_SWITCH_DIAGNOSTICS
+        uint64_t colorConfigurations = 0, materializations = 0, externalCopies = 0;
+#endif
         WP<CWLSurfaceResource> sourceSurface;
         CHyprSignalListener sourceCommit, sourceDestroy, sourceQueued;
         uint64_t generation = 0, convertedGeneration = UINT64_MAX, convertedSource = 0;
@@ -301,6 +305,7 @@ static Aquamarine::SDMABUFAttrs transferSourceAttributes(const SP<IHLBuffer>& bu
 static bool materializeOffload(SState::SNVSlot& slot, NColorManagement::PImageDescription packed, Hyprutils::Math::eTransform transform) {
     auto fail = [&](const std::string& reason) { currentNV().reason = reason; currentNV().client.fail(reason); requestOffloadStop(); return false; };
     if (!slot.texture) {
+        slot.materializationPending=true;
         Aquamarine::SDMABUFAttrs output{}; output.success = true; output.size = {int(slot.width), int(slot.height)}; output.planes = 1;
         output.format = slot.format; output.modifier = DRM_FORMAT_MOD_LINEAR;
         output.fds[0] = slot.outputFD.value; output.strides[0] = slot.stride; output.offsets[0] = slot.offset;
@@ -334,12 +339,19 @@ static bool materializeOffload(SState::SNVSlot& slot, NColorManagement::PImageDe
         if (!waited) return fail("cannot wait for conversion");
     }
     glMemoryBarrier(GL_TEXTURE_FETCH_BARRIER_BIT);
-    if(slot.externalOutput) {
+    if(slot.externalOutput && (slot.materializationPending || !slot.externalOutput->current())) {
         try {
             if(!slot.externalOutput->current())slot.externalOutput->import(slot.width,slot.height,slot.format,slot.outputFD.value,slot.offset,slot.stride);
             slot.externalOutput->copy(dynamic_cast<Render::GL::CGLTexture*>(slot.texture.get())->m_texID);
+#if GPU_SWITCH_DIAGNOSTICS
+            ++currentNV().externalCopies;
+#endif
         }catch(const std::exception& e){return fail(e.what());}
     }
+#if GPU_SWITCH_DIAGNOSTICS
+    if(slot.materializationPending)++currentNV().materializations;
+#endif
+    slot.materializationPending=false;
     slot.texture->m_imageDescription = packed;
     slot.texture->m_transform = transform;
     if (g_state->vram.session==&currentNV() && g_state->vram.pid > 0 && g_state->vram.pid == currentNV().ownerPID) g_state->vram.safeTexture = slot.texture;
@@ -411,21 +423,32 @@ static std::optional<PreparedTexture> prepareOffloadTexture(Render::CRenderConte
     if(!source)return std::nullopt;
     const bool copyOnly=!hdrConversion || !Offload::transportFormat(attrs.format)->floating || source->value().transferFunction!=CM_TRANSFER_FUNCTION_EXT_LINEAR || attrs.modifier!=DRM_FORMAT_MOD_LINEAR || (attrs.format==DRM_FORMAT_ABGR16161616F && !data.texture->m_opaque) || source->value().icc.present;
     if(nv.client.running() && (nv.client.copyOnly!=copyOnly || (copyOnly && nv.client.transportPixelFormat!=attrs.format))){nv.reason="transport mode changed";requestOffloadStop();return std::nullopt;}
-    // Keep content luminance/mastering metadata. Only the transport encoding
-    // changes: ordinary Hyprland composition still owns tone mapping/blending.
-    auto packedData = source->value();
-    packedData.transferFunction = CM_TRANSFER_FUNCTION_ST2084_PQ;
-    packedData.transferFunctionPower = 1.0F;
-    packedData.primariesNameSet = true;
-    packedData.primariesNamed = CM_PRIMARIES_BT2020;
-    packedData.primaries = NColorPrimaries::BT2020;
-    const auto packed = copyOnly?source:fullscreen ? monitor->m_imageDescription : CImageDescription::from(packedData);
-    const auto settings = fullscreen ? g_pHyprRenderer->getCMSettings(ctx, source, packed, data.surface, true,
-        monitor->m_sdrMinLuminance, monitor->m_sdrMaxLuminance, true) :
-        g_pHyprRenderer->getCMSettings(ctx, source, packed, nullptr, false, -1, -1, false);
-    if (!copyOnly && (settings.sourceTF != CM_TRANSFER_FUNCTION_EXT_LINEAR || settings.targetTF != CM_TRANSFER_FUNCTION_ST2084_PQ ||
-        settings.needsTonemap || settings.needsSDRmod || settings.dstTFRange.max <= settings.dstTFRange.min)) {
-        nv.reason = "unsupported color transform"; return std::nullopt;
+    // Native-format transport preserves pixels and their description. Its
+    // worker ignores color uniforms, so only PQ conversion needs CM settings.
+    auto packed=source;
+    std::array<float,16> color{};
+    if(!copyOnly) {
+        auto packedData = source->value();
+        packedData.transferFunction = CM_TRANSFER_FUNCTION_ST2084_PQ;
+        packedData.transferFunctionPower = 1.0F;
+        packedData.primariesNameSet = true;
+        packedData.primariesNamed = CM_PRIMARIES_BT2020;
+        packedData.primaries = NColorPrimaries::BT2020;
+        packed = fullscreen ? monitor->m_imageDescription : CImageDescription::from(packedData);
+        const auto settings = fullscreen ? g_pHyprRenderer->getCMSettings(ctx, source, packed, data.surface, true,
+            monitor->m_sdrMinLuminance, monitor->m_sdrMaxLuminance, true) :
+            g_pHyprRenderer->getCMSettings(ctx, source, packed, nullptr, false, -1, -1, false);
+#if GPU_SWITCH_DIAGNOSTICS
+        ++nv.colorConfigurations;
+#endif
+        if (settings.sourceTF != CM_TRANSFER_FUNCTION_EXT_LINEAR || settings.targetTF != CM_TRANSFER_FUNCTION_ST2084_PQ ||
+            settings.needsTonemap || settings.needsSDRmod || settings.dstTFRange.max <= settings.dstTFRange.min) {
+            nv.reason = "unsupported color transform"; return std::nullopt;
+        }
+        for (int column = 0; column < 3; ++column)
+            for (int row = 0; row < 3; ++row) color[column * 4 + row] = settings.convertMatrix[row][column];
+        color[12] = settings.srcTFRange.min; color[13] = settings.srcTFRange.max - settings.srcTFRange.min;
+        color[14] = settings.dstTFRange.min; color[15] = settings.dstTFRange.max - settings.dstTFRange.min;
     }
     nv.seen = std::chrono::steady_clock::now();
     if (!submissionOnly) nv.lastDraw = nv.seen;
@@ -463,10 +486,7 @@ static std::optional<PreparedTexture> prepareOffloadTexture(Render::CRenderConte
     job.width = attrs.size.x; job.height = attrs.size.y; job.format = attrs.format;
     job.stride = attrs.strides[0]; job.offset = attrs.offsets[0]; job.modifier = attrs.modifier;
     job.source = uint64_t(inode.st_ino) ^ (uint64_t(inode.st_dev) << 32); job.slot = slotIndex;
-    for (int column = 0; column < 3; ++column)
-        for (int row = 0; row < 3; ++row) job.color[column * 4 + row] = settings.convertMatrix[row][column];
-    job.color[12] = settings.srcTFRange.min; job.color[13] = settings.srcTFRange.max - settings.srcTFRange.min;
-    job.color[14] = settings.dstTFRange.min; job.color[15] = settings.dstTFRange.max - settings.dstTFRange.min;
+    job.color = color;
     if (nv.sourceSurface.lock() != data.surface) {
         nv.sourceCommit.reset(); nv.sourceDestroy.reset(); nv.sourceQueued.reset(); nv.cachedSlot.reset();
         nv.sourceSurface = data.surface; ++nv.generation;
@@ -511,6 +531,7 @@ static std::optional<PreparedTexture> prepareOffloadTexture(Render::CRenderConte
     if (slot.width != response.width || slot.height != response.height || slot.stride != response.stride || slot.offset != response.offset || slot.format!=response.format) {
         slot.texture.reset();slot.externalOutput.reset(); // Reimport at the new logical size.
     }
+    slot.materializationPending=true;
     slot.outputFD = std::move(received[0]);
     slot.width = response.width; slot.height = response.height; slot.stride = response.stride; slot.offset = response.offset;slot.format=response.format;
     slot.conversionComplete.reset();
@@ -536,7 +557,7 @@ static std::optional<PreparedTexture> prepareOffloadTexture(Render::CRenderConte
 // on createTexture/bind, which stock Hyprland explicitly rejects.
 SP<Render::ITexture> GpuSwitch::createClientTransferTexture(void* self,const Aquamarine::SDMABUFAttrs& attrs,bool opaque,TransferTextureFactory original,bool& handled) {
     handled=g_state && g_vramConstructing && attrs.planes==1 && attrs.modifier==DRM_FORMAT_MOD_LINEAR &&
-        (attrs.format==DRM_FORMAT_XBGR16161616F || attrs.format==DRM_FORMAT_ABGR16161616F);
+        Offload::transportFormat(attrs.format).has_value();
     if(!handled)return {};
     g_vramCreateOriginal=original;
     return vramCreateTexture(self,attrs,opaque);
@@ -611,11 +632,11 @@ class COffloadSurfaceElement : public IPassElement {
         auto& rd = ctx.m_data;
         const auto damage = rd.damage;
         auto* element = surface();
-        const auto source = sourceDescription(*element);
         const auto prepared = prepareOffloadTexture(ctx, *element, rd.pMonitor.lock(), fullscreen);
         if (!prepared) { g_pHyprRenderer->draw(ctx, original, damage); return {}; }
         SessionScope selected(prepared->session);
         auto& slot = currentNV().slots[prepared->slot];
+        const auto source = currentNV().client.copyOnly ? NColorManagement::PImageDescription{} : sourceDescription(*element);
         auto texture = element->m_data.texture;
         {
             const auto used = ctx.m_usedAsyncBuffers.size();
@@ -797,6 +818,7 @@ static GpuSwitch::Json transferSessionStatus(const SState::SNV& nv) {
 #if GPU_SWITCH_DIAGNOSTICS
         ,{"frames",nv.frames},{"reused",nv.reused},{"window_frames",nv.windowFrames},
         {"capture_frames",nv.captureFrames},{"eager_frames",nv.eagerFrames},
+        {"color_configurations",nv.colorConfigurations},{"materializations",nv.materializations},{"external_copies",nv.externalCopies},
         {"pending_inputs",g_state->retainedInputs.size()},{"protected_textures",g_state->vram.protectedTextures},{"vram_layout",g_state->vram.layoutDiagnostic}
 #endif
     };
