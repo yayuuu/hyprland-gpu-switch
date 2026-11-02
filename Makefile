@@ -32,13 +32,13 @@ HEADERS = $(wildcard *.hpp vendor/aquamarine/*.hpp transfer/*.hpp) diagnostics/d
 all: hyprland-gpu-switch.so
 
 check-deps:
-	@$(PKG_CONFIG) --print-errors --exists $(PACKAGES) 'hyprland = 0.57.0' 'aquamarine = 0.15.1'
+	@$(PKG_CONFIG) --print-errors --exists $(PACKAGES)
 
 $(BUILD_DIR):
 	mkdir -p $@
 
 $(BUILD_DIR)/hyprland-gpu-switch.so: $(SOURCES) $(HEADERS) Makefile $(BUILD_DIR)/gpu-transfer-worker | check-deps $(BUILD_DIR)
-	$(CXX) $(COMPILE_FLAGS) -DGPU_TRANSFER_WORKER_PATH='"$(BUILD_DIR)/gpu-transfer-worker"' -DGPU_TRANSFER_AQ_VERSION='"$(shell $(PKG_CONFIG) --modversion aquamarine)"' -shared -fPIC -fno-gnu-unique $(PACKAGE_CFLAGS) $(SOURCES) $(LDFLAGS) $(PACKAGE_LIBS) -o $@.new
+	$(CXX) $(COMPILE_FLAGS) -DGPU_TRANSFER_WORKER_PATH='"$(BUILD_DIR)/gpu-transfer-worker"' -shared -fPIC -fno-gnu-unique $(PACKAGE_CFLAGS) $(SOURCES) $(LDFLAGS) $(PACKAGE_LIBS) -o $@.new
 	mv $@.new $@
 
 # Always select the requested profile, even when switching back to an older build.

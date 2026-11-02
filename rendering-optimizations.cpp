@@ -55,9 +55,6 @@
 #include "capture-wait.hpp"
 #include "transfer/pq.hpp"
 
-static_assert(std::string_view{GIT_COMMIT_HASH} == "0aa6745f705f2c4b0a5004eb019ef76e5bbdb426", "Build against Hyprland v0.57.0 headers");
-static_assert(std::string_view{GPU_TRANSFER_AQ_VERSION}.substr(0, 4) == "0.15", "Build against Aquamarine 0.15.x headers");
-
 static HANDLE g_handle = nullptr;
 static CFunctionHook* g_shareHook = nullptr;
 static CFunctionHook* g_copyFBHook = nullptr;

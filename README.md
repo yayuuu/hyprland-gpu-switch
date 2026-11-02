@@ -53,7 +53,7 @@ VRR capability handling validates the connector's actual DRM properties and corr
 
 ## Requirements
 
-This version targets **Hyprland 0.57.0** (`0aa6745f705f2c4b0a5004eb019ef76e5bbdb426`) and **Aquamarine 0.15.1**. Development headers must match the installed compositor and libraries. Other versions require compatibility work.
+This version was developed against **Hyprland 0.57.0** (`0aa6745f705f2c4b0a5004eb019ef76e5bbdb426`) and **Aquamarine 0.15.1**. Development headers must match the installed compositor and libraries. The build does not enforce these versions and attempts compilation with the installed dependencies; incompatible APIs may cause compilation errors.
 
 Build tools: **GCC/G++ 14 or another compatible C++23 toolchain**, GNU Make, `pkg-config`, `glslangValidator` (`glslang-tools`) and binutils. GCC 14.2 is the tested compiler.
 
@@ -84,7 +84,7 @@ sudo apt install build-essential pkg-config glslang-tools binutils \
   libegl-dev libgles-dev libvulkan-dev
 ```
 
-Package names and availability vary by distribution. Install Hyprland's matching transitive development dependencies as well. The build checks the required package versions before compiling.
+Package names and availability vary by distribution. Install Hyprland's matching transitive development dependencies as well. The build checks that the required packages are available before compiling.
 
 ## Build and install
 
@@ -108,7 +108,7 @@ hyprpm add https://github.com/yayuuu/hyprland-gpu-switch.git
 hyprpm enable hyprland-gpu-switch
 ```
 
-The manifest pins Hyprland 0.56.2 to plugin commit `c088b367fe4180f4812fe8a0e23fced8913ccf96`. Hyprland 0.57.0 follows the latest revision of the default branch. The same compiler, dependencies and version checks still apply.
+The manifest pins Hyprland 0.56.2 to plugin commit `c088b367fe4180f4812fe8a0e23fced8913ccf96`. Hyprland 0.57.0 follows the latest revision of the default branch. The same compiler and dependency requirements still apply.
 
 This plugin needs to load before rendering starts. Enabling it in an existing session is not enough: configure early loading of the installed library and start a new login session. For Hyprland 0.57.0, the hyprpm-managed library can be loaded with:
 

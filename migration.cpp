@@ -47,7 +47,6 @@
 using namespace Render;
 using namespace Render::GL;
 using namespace GpuSwitch;
-static_assert(std::string_view(GIT_COMMIT_HASH)=="0aa6745f705f2c4b0a5004eb019ef76e5bbdb426","Only verified with Hyprland 0.57.0");
 static HANDLE pluginHandle=nullptr;
 static std::vector<CFunctionHook*> hooks;
 static std::map<ITexture*,WP<ITexture>> textures;

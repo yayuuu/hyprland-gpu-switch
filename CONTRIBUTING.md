@@ -118,7 +118,7 @@ Installation replaces the library atomically. It does not reload a running plugi
 
 ## hyprpm manifest
 
-`hyprpm.toml` pins Hyprland 0.56.2 (`efb50993780079460b0cbed1363e2166a2de1d9f`) to the last compatible plugin commit, `c088b367fe4180f4812fe8a0e23fced8913ccf96`. Hyprland 0.57.0 follows the latest revision of the repository's default branch. Compatibility remains enforced by the build's dependency version checks and the plugin's Hyprland hash checks.
+`hyprpm.toml` pins Hyprland 0.56.2 (`efb50993780079460b0cbed1363e2166a2de1d9f`) to the last compatible plugin commit, `c088b367fe4180f4812fe8a0e23fced8913ccf96`. Hyprland 0.57.0 follows the latest revision of the repository's default branch. The build checks dependency availability without enforcing specific Hyprland or Aquamarine versions or header commits. Incompatible APIs may cause compilation errors. The plugin still checks that the running Hyprland hash matches the headers used to build it.
 
 The manifest runs `make clean` before `make DIAGNOSTICS=0` to rebuild against the selected Hyprland headers and avoid accepting a stale shared library after a failed build. No revision placeholders or fabricated commit hashes are used.
 
